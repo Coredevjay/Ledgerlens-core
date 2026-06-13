@@ -178,6 +178,8 @@ ledgerlens-core/
 ├── pyproject.toml                    ← Project metadata, pytest config
 ├── .env.example                      ← Configuration template (incl. cross-repo keys)
 ├── run_pipeline.py                   ← Full detection pipeline entry point
+├── cli.py                            ← `ledgerlens` CLI (generate-data, train, score, serve)
+├── Dockerfile / docker-compose.yml   ← Containerized local API
 │
 ├── config/
 │   └── settings.py                   ← Environment-driven configuration
@@ -187,24 +189,28 @@ ledgerlens-core/
 │   ├── historical_loader.py          ← Bulk historical trade ingestion
 │   ├── operations_loader.py          ← Order-book event ingestion (offer ops)
 │   ├── account_loader.py             ← Account funding-source / creation-time metadata
+│   ├── synthetic_data.py             ← Synthetic trade/wash-ring generator for local training
+│   ├── http_client.py                ← Retrying HTTP helper for Horizon calls
 │   └── data_models.py                ← Pydantic schemas for trade/asset/order-book records
 │
 ├── detection/
 │   ├── benford_engine.py             ← Benford's Law feature computation
 │   ├── feature_engineering.py        ← On-chain ML feature extraction
+│   ├── dataset.py                    ← Labelled feature dataset builder (training)
 │   ├── model_training.py             ← Train ensemble classifiers
 │   ├── model_inference.py            ← Real-time risk scoring
 │   ├── shap_explainer.py             ← SHAP interpretability layer
-│   └── risk_score.py                 ← Shared `RiskScore` schema + scoring logic
+│   ├── risk_score.py                 ← Shared `RiskScore` schema + scoring logic
+│   └── storage.py                    ← SQLite-backed local RiskScore store
+│
+├── api/
+│   └── main.py                       ← Local read-only FastAPI app serving RiskScores
 │
 └── tests/
-    ├── test_benford.py
-    └── test_features.py
+    └── ...
 ```
 
 ## Quick Start
-
-> This repository is in early-stage development — components below are being built out per the [Roadmap](#roadmap).
 
 ### 1. Install dependencies
 
@@ -212,13 +218,7 @@ ledgerlens-core/
 pip install -r requirements.txt
 ```
 
-### 2. Run the detection pipeline
-
-```bash
-python run_pipeline.py
-```
-
-### 3. Configure environment
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
@@ -227,9 +227,54 @@ cp .env.example .env
 Fill in the Horizon, model, and cross-repo settings described in
 [LedgerLens Organization](#ledgerlens-organization).
 
-> Steps for the API, dashboard, and Soroban contract live in their
+### 3. Train on synthetic data
+
+No labelled dataset from `ledgerlens-data` is required to get started —
+`cli.py train` generates a synthetic trade history with labelled
+wash-trading rings (`ingestion/synthetic_data.py`) and trains the
+RF/XGBoost/LightGBM ensemble on it:
+
+```bash
+python cli.py train
+```
+
+### 4. Run the detection pipeline
+
+```bash
+python run_pipeline.py
+```
+
+This scores each wallet/asset-pair combination and writes the resulting
+`RiskScore` records to the local SQLite store (`LEDGERLENS_DB_PATH`).
+
+### 5. Serve the local API
+
+```bash
+python cli.py serve --reload
+```
+
+Exposes `/health`, `/scores`, `/scores/{wallet}`, `/alerts`, and
+`/assets/risk-ranking` over the locally stored `RiskScore` records — a
+stand-in for `ledgerlens-api` during local development.
+
+> The production API, dashboard, and Soroban contract live in their
 > respective repos (`ledgerlens-api`, `ledgerlens-dashboard`,
 > `ledgerlens-contracts`).
+
+### Docker
+
+```bash
+docker compose up --build
+```
+
+## CLI Reference
+
+```bash
+python cli.py generate-data   # write synthetic trades/labels to CSV
+python cli.py train           # train the ensemble on synthetic data
+python cli.py score           # run the pipeline against live Horizon data
+python cli.py serve           # serve the local API
+```
 
 ## Testing
 
@@ -240,21 +285,26 @@ pytest
 Covers:
 - ✅ Benford's Law feature computation
 - ✅ ML feature engineering (trade pattern, volume/timing features)
+- ✅ Synthetic data generation and labelled dataset building
+- ✅ RiskScore combination logic and SQLite storage
+- ✅ Local API and CLI
+- ✅ Horizon HTTP retry/backoff behaviour
 
 ## Roadmap
 
 ### Phase 1 — Foundation *(Months 1–2)*
-- [ ] Stellar Horizon API ingestion pipeline (historical + streaming)
-- [ ] Benford's Law engine for on-chain transaction amounts
-- [ ] Initial feature engineering from SDEX trade data
-- [ ] Baseline ML model training on historical wash trade patterns
+- [x] Stellar Horizon API ingestion pipeline (historical + streaming)
+- [x] Benford's Law engine for on-chain transaction amounts
+- [x] Initial feature engineering from SDEX trade data
+- [x] Baseline ML model training on synthetic wash trade patterns
 - [ ] Internal testing on Stellar Testnet
 
 ### Phase 2 — Core Product *(Months 3–4)*
-- [ ] Full ensemble model training and evaluation
-- [ ] SHAP interpretability integration
+- [x] Full ensemble model training and evaluation
+- [x] SHAP interpretability integration
 - [ ] Soroban smart contract deployment on Testnet
-- [ ] Public REST API (v1) with rate limiting
+- [x] Local REST API (v1, read-only) — see `api/main.py`
+- [ ] Public REST API with rate limiting (`ledgerlens-api`)
 - [ ] Web dashboard (beta)
 
 ### Phase 3 — Ecosystem Integration *(Months 5–6)*
