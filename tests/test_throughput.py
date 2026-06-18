@@ -11,6 +11,7 @@ sequential one would take 50 s and fail the 10 s threshold.
 """
 
 import asyncio
+import dataclasses
 import time
 
 import joblib
@@ -117,10 +118,17 @@ async def test_async_run_throughput_500_wallets(tmp_path, monkeypatch):
     )
 
     models_path = _save_temp_models(tmp_path)
-    object.__setattr__(settings_module.settings, "model_dir", models_path)
-    object.__setattr__(settings_module.settings, "db_path", str(tmp_path / "ledgerlens.db"))
-    object.__setattr__(settings_module.settings, "score_contract_id", "")
-    object.__setattr__(settings_module.settings, "service_secret_key", "")
+    monkeypatch.setattr(
+        settings_module,
+        "settings",
+        dataclasses.replace(
+            settings_module.settings,
+            model_dir=models_path,
+            db_path=str(tmp_path / "ledgerlens.db"),
+            score_contract_id="",
+            service_secret_key="",
+        ),
+    )
 
     # Mock historical trades (no real HTTP pagination needed).
     async def _return_trades(**kwargs):

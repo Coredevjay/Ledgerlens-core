@@ -5,7 +5,7 @@ import os
 import joblib
 import numpy as np
 
-from config.settings import settings
+import config.settings as settings_module
 from detection.feature_engineering import FEATURE_NAMES
 
 _MODEL_FILENAMES = {
@@ -17,7 +17,7 @@ _MODEL_FILENAMES = {
 
 def load_models(model_dir: str | None = None) -> dict:
     """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
-    model_dir = model_dir or settings.model_dir
+    model_dir = model_dir or settings_module.settings.model_dir
     models = {}
     for name, filename in _MODEL_FILENAMES.items():
         path = os.path.join(model_dir, filename)
@@ -29,6 +29,7 @@ def load_models(model_dir: str | None = None) -> dict:
 
 
 def _get_ensemble_weights() -> dict[str, float]:
+    settings = settings_module.settings
     return {
         "random_forest": settings.ensemble_weight_rf,
         "xgboost": settings.ensemble_weight_xgb,

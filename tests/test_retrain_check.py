@@ -1,5 +1,6 @@
 """Tests for continuous retraining with drift detection."""
 
+import dataclasses
 import json
 from unittest.mock import MagicMock, patch
 
@@ -27,10 +28,14 @@ class TestRetrainCheckCommand:
             }, f)
 
     def _configure_model_dir(self, monkeypatch, metadata_dir):
-        monkeypatch.setenv("MODEL_DIR", str(metadata_dir))
         import config.settings as settings_module
 
-        object.__setattr__(settings_module.settings, "model_dir", str(metadata_dir))
+        monkeypatch.setenv("MODEL_DIR", str(metadata_dir))
+        monkeypatch.setattr(
+            settings_module,
+            "settings",
+            dataclasses.replace(settings_module.settings, model_dir=str(metadata_dir)),
+        )
 
     def test_retrain_check_skipped_when_no_drift(self, monkeypatch, tmp_path):
         """retrain-check should skip retraining when drift is not detected."""
