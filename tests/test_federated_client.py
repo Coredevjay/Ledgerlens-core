@@ -7,8 +7,6 @@ Covers:
 """
 
 import numpy as np
-import pytest
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from detection.dataset import build_training_dataset
 from detection.feature_engineering import FEATURE_NAMES
@@ -43,7 +41,7 @@ def _make_server(tmp_path, min_participants=1) -> FederatedAggregationServer:
 # ── (a) Client updates local weights after receiving global model ──────────────
 
 def test_client_updates_local_weights_after_global_received(tmp_path):
-    server = _make_server(tmp_path)
+    _make_server(tmp_path)
     X, y = _make_local_data(seed=7)
     X_pub = _build_public_dataset()
 

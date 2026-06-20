@@ -30,13 +30,13 @@ Run as a standalone process via:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
 import threading
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 
 import numpy as np
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -49,6 +49,9 @@ from cryptography.hazmat.primitives.serialization import (
     load_der_public_key,
 )
 from cryptography.exceptions import InvalidSignature
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from config.settings import settings
 from detection.federated.audit import (
@@ -358,11 +361,6 @@ class FederatedAggregationServer:
 # ---------------------------------------------------------------------------
 # FastAPI HTTP wrapper
 # ---------------------------------------------------------------------------
-
-import base64
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 _server_instance: FederatedAggregationServer | None = None
 

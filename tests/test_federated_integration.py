@@ -9,8 +9,6 @@ Runs entirely in-process using threads — no HTTP server required.
 import threading
 
 import numpy as np
-import pytest
-from sklearn.model_selection import train_test_split
 
 from detection.dataset import build_training_dataset
 from detection.feature_engineering import FEATURE_NAMES
@@ -35,7 +33,6 @@ def _make_data(seed: int) -> tuple[np.ndarray, np.ndarray]:
 def _register_client(
     server: FederatedAggregationServer, client: FederatedClient
 ) -> None:
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     pub_der = client.public_key_der
     server.register_participant(client.operator_id, pub_der)
 

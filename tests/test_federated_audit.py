@@ -9,7 +9,6 @@ Covers:
 import json
 
 import numpy as np
-import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_der_public_key
 
@@ -17,7 +16,6 @@ from detection.federated.audit import (
     build_record,
     get_audit_records,
     get_cumulative_epsilon,
-    save_audit_record,
     sign_record,
     verify_record,
 )
@@ -45,7 +43,6 @@ def _register_and_submit(
 ) -> None:
     import uuid
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
     pid = str(uuid.uuid4())
     sk = Ed25519PrivateKey.generate()

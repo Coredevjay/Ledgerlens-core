@@ -37,6 +37,7 @@ from detection.storage import (
     get_liquidity_pool_trades,
     get_pair_correlations,
     get_retrain_runs,
+    get_rings,
     get_shap_values,
 )
 from detection.webhook_queue import get_dead_letters
@@ -231,6 +232,12 @@ def asset_risk_ranking() -> list[dict]:
         for pair, values in by_pair.items()
     ]
     return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
+
+
+@app.get("/rings")
+def list_rings() -> list[dict]:
+    """Return detected wash-trading rings from the latest pipeline run."""
+    return get_rings()
 
 
 @app.get("/correlations")

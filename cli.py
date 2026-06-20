@@ -394,7 +394,7 @@ def federated_server(
     import uvicorn
 
     from config.settings import settings as cfg
-    from detection.federated.server import FederatedAggregationServer, federated_app as fl_app, _server_instance
+    from detection.federated.server import FederatedAggregationServer, federated_app as fl_app
     import detection.federated.server as fed_server_mod
 
     kwargs: dict = {}

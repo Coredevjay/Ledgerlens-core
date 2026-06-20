@@ -8,11 +8,9 @@ Covers:
   (e) Audit record is created and signed for each round.
 """
 
-import hashlib
 import json
 
 import numpy as np
-import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
