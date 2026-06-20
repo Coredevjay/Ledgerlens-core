@@ -180,6 +180,25 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_retrain_runs_model_name ON retrain_runs (model_name);
         """,
     ),
+    (
+        6,
+        "add robustness_reports table for adversarial evaluation",
+        """
+        CREATE TABLE IF NOT EXISTS robustness_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            asr_json TEXT NOT NULL,
+            mean_map REAL NOT NULL,
+            p95_map REAL NOT NULL,
+            certified_radius REAL NOT NULL,
+            n_samples INTEGER NOT NULL,
+            epsilon REAL NOT NULL,
+            report_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_robustness_reports_created_at ON robustness_reports (created_at);
+        """,
+    ),
 ]
 
 
@@ -761,6 +780,43 @@ def get_retrain_runs(
     return [_row_to_retrain_run(row) for row in rows]
 
 
+def save_robustness_report(report: dict, db_path: str | None = None) -> None:
+    """Persist a robustness report dict to the robustness_reports table."""
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO robustness_reports
+                (created_at, model_version, asr_json, mean_map, p95_map, certified_radius, n_samples, epsilon, report_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                report.get("model_version", ""),
+                json.dumps(report.get("asr", {})),
+                float(report.get("mean_map", 0.0)),
+                float(report.get("p95_map", 0.0)),
+                float(report.get("certified_radius", 0.0)),
+                int(report.get("n_samples", 0)),
+                float(report.get("epsilon", 0.0)),
+                json.dumps(report),
+            ),
+        )
+        conn.commit()
+
+
+def get_latest_robustness_report(db_path: str | None = None) -> dict | None:
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT report_json FROM robustness_reports ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0])
+
+
 def _asset_pair_symbol(asset: dict) -> str:
     code = asset["code"]
     issuer = asset.get("issuer")
@@ -928,6 +984,69 @@ def get_circular_routes(
             "is_atomic_self_payment": bool(row[4]),
             "touches_pool": bool(row[5]),
             "timestamp": row[6],
+        }
+        for row in rows
+    ]
+
+
+def save_rings(rings: list[dict], db_path: str | None = None) -> None:
+    """Persist `find_wash_rings` output from the latest pipeline run."""
+    if not rings:
+        return
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO wash_rings
+                (accounts_json, total_volume, cycle_volume, avg_trade_count,
+                 timing_tightness, truncated, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    json.dumps(r["accounts"]),
+                    r["total_volume"],
+                    r["cycle_volume"],
+                    r.get("avg_trade_count", 0.0),
+                    r.get("timing_tightness", 0.0),
+                    int(r.get("truncated", False)),
+                    ts,
+                )
+                for r in rings
+            ],
+        )
+        conn.commit()
+
+
+def get_rings(
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return detected wash-trading rings, most recent first, paginated."""
+    init_db(db_path)
+    query = (
+        "SELECT accounts_json, total_volume, cycle_volume, avg_trade_count, "
+        "timing_tightness, truncated, detected_at FROM wash_rings ORDER BY detected_at DESC"
+    )
+    params: list = []
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "accounts": json.loads(row[0]),
+            "total_volume": row[1],
+            "cycle_volume": row[2],
+            "avg_trade_count": row[3],
+            "timing_tightness": row[4],
+            "truncated": bool(row[5]),
+            "detected_at": row[6],
         }
         for row in rows
     ]

@@ -40,7 +40,8 @@ At a high level, it does three things:
 - **On-Chain Risk Registry**: Soroban smart contract exposes risk scores so AMMs, lending protocols, and aggregators can gate suspicious activity natively
 - **Public REST API**: Query scores, recent alerts, and asset risk rankings
 - **Lightweight Dashboard**: Web UI for risk-score visibility without requiring technical expertise
-- **Open Methodology**: Scores, features, and training data are fully transparent and auditable
+ 
+ - Adversarial robustness evaluation: attack, certificate, and hardening tools (see docs/adversarial_robustness.md)
 
 ## Architecture
 

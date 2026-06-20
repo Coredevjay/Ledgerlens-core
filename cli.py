@@ -326,6 +326,40 @@ def eval_robustness(
         typer.echo(f"⚠️  Target missed: adversarial training delta-AUC = {adv_delta:+.3f} (target > -0.10)")
 
 
+
+@app.command("robustness-eval")
+def robustness_eval(
+    epsilon: float = typer.Option(0.1, help="Attack L2 budget"),
+    steps: int = typer.Option(10, help="PGD steps (max 100)"),
+    n_samples: int = typer.Option(200, help="Number of samples from test split to evaluate"),
+) -> None:
+    """Run PGD attacks on the test split and produce a RobustnessReport saved to DB."""
+    if steps > 100:
+        raise typer.BadParameter("--steps cannot exceed 100 for safety")
+
+    from ingestion.synthetic_data import generate_synthetic_dataset
+    from detection.dataset import build_training_dataset
+    from detection.model_inference import load_models
+    from detection.robustness_eval import compute_robustness_report
+    from config.settings import settings
+
+    trades, account_metadata, events, labels = generate_synthetic_dataset(n_normal_accounts=50, n_wash_rings=10, ring_size=4, seed=42)
+    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
+
+    try:
+        models = load_models(settings.model_dir)
+    except FileNotFoundError:
+        # train a temporary ensemble for evaluation
+        from detection.model_training import train_ensemble
+
+        logger.info("No trained models found; training temporary ensemble for robustness evaluation")
+        results = train_ensemble(df, adversarial_augment=False)
+        models = {k: v["model"] for k, v in results.items()}
+
+    report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
+    typer.echo(report.json(indent=2))
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
@@ -468,6 +502,137 @@ def webhook_worker(
     from detection.webhook_worker import run_delivery_worker
 
     asyncio.run(run_delivery_worker(interval_seconds=interval))
+
+
+federated_app = typer.Typer(help="Federated Learning commands for exchange operators")
+app.add_typer(federated_app, name="federated")
+
+
+@federated_app.command("server")
+def federated_server(
+    host: str = typer.Option(None, help="Host to bind (default from FEDERATED_SERVER_HOST)"),
+    port: int = typer.Option(None, help="Port to bind (default from FEDERATED_SERVER_PORT)"),
+    min_participants: int = typer.Option(None, help="Minimum quorum size before aggregation"),
+) -> None:
+    """Start the federated aggregation server as a standalone process."""
+    import uvicorn
+
+    from config.settings import settings as cfg
+    from detection.federated.server import FederatedAggregationServer, federated_app as fl_app
+    import detection.federated.server as fed_server_mod
+
+    kwargs: dict = {}
+    if min_participants is not None:
+        kwargs["min_participants"] = min_participants
+    fed_server_mod._server_instance = FederatedAggregationServer(**kwargs)
+
+    bind_host = host or cfg.federated_server_host
+    bind_port = port or cfg.federated_server_port
+    logger.info("Starting federated server on %s:%d", bind_host, bind_port)
+    uvicorn.run(fl_app, host=bind_host, port=bind_port)
+
+
+@federated_app.command("join")
+def federated_join(
+    rounds: int = typer.Option(1, "--rounds", "-r", help="Number of federated rounds to participate in"),
+    data_path: str = typer.Option(None, "--data-path", help="Path to operator's private labelled CSV"),
+    server_url: str = typer.Option(None, "--server-url", help="Federated server URL"),
+    operator_id: str = typer.Option("operator-0", "--operator-id", help="Unique operator identifier"),
+) -> None:
+    """Join the federated training pool as an exchange operator.
+
+    If --data-path is omitted, a synthetic dataset is generated locally
+    (useful for testing the protocol without real private data).
+    """
+    import httpx
+    import base64
+
+    import numpy as np
+
+    from config.settings import settings as cfg
+    from detection.dataset import build_training_dataset
+    from detection.feature_engineering import FEATURE_NAMES
+    from detection.federated.client import FederatedClient, _build_public_dataset
+    from ingestion.synthetic_data import generate_synthetic_dataset
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    server_url = server_url or f"http://{cfg.federated_server_host}:{cfg.federated_server_port}"
+
+    # Load or generate private training data
+    if data_path:
+        import pandas as pd
+        df = pd.read_csv(data_path)
+        X = df[FEATURE_NAMES].fillna(0.0).values.astype(np.float64)
+        y = df["label"].values.astype(int)
+    else:
+        logger.info("No --data-path provided; using synthetic private dataset (seed=99)")
+        trades, meta, events, labels = generate_synthetic_dataset(
+            n_normal_accounts=30, n_wash_rings=5, ring_size=3, seed=99
+        )
+        df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
+        X = df[FEATURE_NAMES].fillna(0.0).values.astype(np.float64)
+        y = df["label"].values.astype(int)
+
+    private_key = Ed25519PrivateKey.generate()
+    client = FederatedClient(operator_id=operator_id, private_key=private_key)
+
+    with httpx.Client(base_url=server_url, timeout=60.0) as http:
+        # Register with server
+        pub_der_b64 = base64.b64encode(client.public_key_der).decode()
+        resp = http.post("/federated/register", json={
+            "participant_id": operator_id,
+            "public_key_der_b64": pub_der_b64,
+        })
+        resp.raise_for_status()
+        logger.info("Registered with federated server as %s", operator_id)
+
+        X_pub = _build_public_dataset()
+        client.train_local_models(X, y)
+
+        for round_num in range(rounds):
+            # Fetch current global model
+            resp = http.get("/federated/global-model")
+            resp.raise_for_status()
+            data = resp.json()
+            round_id = data["round_id"]
+
+            if data["global_soft_labels_b64"]:
+                prev_global = np.frombuffer(
+                    base64.b64decode(data["global_soft_labels_b64"]), dtype=np.float64
+                )
+            else:
+                prev_global = np.full(len(X_pub), 0.5)
+
+            soft_labels = client.compute_soft_labels(X_pub)
+            delta = soft_labels - prev_global
+            delta = client._clip_delta(delta)
+            noisy_delta = client.inject_dp_noise(delta)
+            noisy_soft_labels = np.clip(prev_global + noisy_delta, 0.0, 1.0)
+
+            signature = client._sign_payload(noisy_soft_labels, len(y), round_id)
+
+            resp = http.post("/federated/update", json={
+                "participant_id": operator_id,
+                "soft_labels_b64": base64.b64encode(noisy_soft_labels.tobytes()).decode(),
+                "n_samples": len(y),
+                "signature_b64": base64.b64encode(signature).decode(),
+            })
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info("Round %d submitted: %s", round_num + 1, result)
+
+            # Wait and fetch updated global model for distillation
+            resp = http.get("/federated/global-model")
+            resp.raise_for_status()
+            data = resp.json()
+            if data["global_soft_labels_b64"]:
+                global_labels = np.frombuffer(
+                    base64.b64decode(data["global_soft_labels_b64"]), dtype=np.float64
+                )
+                client.update_with_distilled_labels(X, y, X_pub, global_labels)
+                logger.info("Round %d: distillation update applied", round_num + 1)
+
+    logger.info("Federated participation complete (%d round(s))", rounds)
 
 
 if __name__ == "__main__":

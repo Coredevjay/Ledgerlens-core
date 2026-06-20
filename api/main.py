@@ -38,6 +38,7 @@ from detection.storage import (
     get_liquidity_pool_trades,
     get_pair_correlations,
     get_retrain_runs,
+    get_rings,
     get_shap_values,
 )
 from detection.webhook_queue import get_dead_letters
@@ -234,6 +235,12 @@ def asset_risk_ranking() -> list[dict]:
     return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
 
 
+@app.get("/rings")
+def list_rings() -> list[dict]:
+    """Return detected wash-trading rings from the latest pipeline run."""
+    return get_rings()
+
+
 @app.get("/correlations")
 def list_correlations() -> list[dict]:
     """Return the most recent set of correlated asset pairs from the pipeline.
@@ -352,6 +359,17 @@ def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     return get_drift_reports(limit=limit)
 
 
+@app.get("/admin/robustness-report", dependencies=[Depends(require_admin_key)])
+def robustness_report() -> dict:
+    """Return the latest RobustnessReport from the database (admin only)."""
+    from detection.storage import get_latest_robustness_report
+
+    report = get_latest_robustness_report()
+    if report is None:
+        raise HTTPException(status_code=404, detail="No robustness report found")
+    return report
+
+
 @app.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])
 def retrain_runs(
     limit: int = Query(default=50, ge=1, le=1000),
@@ -359,6 +377,15 @@ def retrain_runs(
 ) -> list[dict]:
     """Return the most recent per-model retrain outcomes recorded by `cli.py retrain-check`."""
     return get_retrain_runs(limit=limit, model_name=model_name)
+
+
+@app.get("/admin/federated/audit-log", dependencies=[Depends(require_admin_key)])
+def federated_audit_log(
+    limit: int = Query(default=50, ge=1, le=1000),
+) -> list[dict]:
+    """Return the most recent federated-round audit records (participant IDs are SHA-256 hashed)."""
+    from detection.federated.audit import get_audit_records
+    return get_audit_records(limit=limit)
 
 
 # ---------------------------------------------------------------------------
