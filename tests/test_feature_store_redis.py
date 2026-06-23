@@ -26,7 +26,7 @@ def sample_state():
 def test_feature_store_redis_set_get(sample_state):
     """Test set_state / get_state with Redis (using fakeredis)."""
     try:
-        import fakeredis
+        import fakeredis  # noqa: F401
     except ImportError:
         pytest.skip("fakeredis not installed")
     
@@ -51,7 +51,7 @@ def test_feature_store_redis_set_get(sample_state):
 def test_feature_store_redis_ttl(sample_state):
     """Test that TTL is set on set_state."""
     try:
-        import fakeredis
+        import fakeredis  # noqa: F401
     except ImportError:
         pytest.skip("fakeredis not installed")
     
@@ -66,6 +66,8 @@ def test_feature_store_redis_ttl(sample_state):
         
         # Check TTL was set (fakeredis stores TTL internally)
         key = fs._hash_key(sample_state.wallet, sample_state.asset_pair)
+        mock_client.ttl(key)
+        # fakeredis returns -1 if no TTL or -2 if key doesn't exist
         # This test verifies the key was stored
         assert mock_client.exists(key) > 0
 
@@ -73,7 +75,7 @@ def test_feature_store_redis_ttl(sample_state):
 def test_feature_store_redis_scan_all_keys(sample_state):
     """Test scan_all_keys retrieves all stored keys."""
     try:
-        import fakeredis
+        import fakeredis  # noqa: F401
     except ImportError:
         pytest.skip("fakeredis not installed")
     
@@ -100,7 +102,9 @@ def test_feature_store_redis_scan_all_keys(sample_state):
 
 def test_feature_store_redis_fallback_on_connection_error():
     """Test fallback to in-process dict when Redis is unavailable."""
-    if importlib.util.find_spec("fakeredis") is None:
+    try:
+        import fakeredis  # noqa: F401
+    except ImportError:
         pytest.skip("fakeredis not installed")
     
     with patch("detection.feature_store.redis.from_url") as mock_redis:
@@ -116,7 +120,9 @@ def test_feature_store_redis_fallback_on_connection_error():
 
 def test_feature_store_redis_fallback_on_ping_error():
     """Test fallback when redis.ping() fails."""
-    if importlib.util.find_spec("fakeredis") is None:
+    try:
+        import fakeredis  # noqa: F401
+    except ImportError:
         pytest.skip("fakeredis not installed")
     
     with patch("detection.feature_store.redis.from_url") as mock_redis:
@@ -148,7 +154,7 @@ def test_feature_store_fallback_dict_get_set(sample_state):
 def test_feature_store_delete_state_redis(sample_state):
     """Test delete_state with Redis."""
     try:
-        import fakeredis
+        import fakeredis  # noqa: F401
     except ImportError:
         pytest.skip("fakeredis not installed")
     
@@ -187,7 +193,9 @@ def test_feature_store_delete_state_fallback(sample_state):
 
 def test_feature_store_fallback_to_dict_on_redis_error(sample_state):
     """Test that operations fall back to dict when Redis operations fail."""
-    if importlib.util.find_spec("fakeredis") is None:
+    try:
+        import fakeredis  # noqa: F401
+    except ImportError:
         pytest.skip("fakeredis not installed")
     
     with patch("detection.feature_store.redis.from_url") as mock_redis:
@@ -215,7 +223,7 @@ def test_is_using_redis():
     assert not fs_no_redis.is_using_redis()
     
     try:
-        import fakeredis
+        import fakeredis  # noqa: F401
     except ImportError:
         pytest.skip("fakeredis not installed")
     

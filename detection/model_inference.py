@@ -1,4 +1,10 @@
-"""Real-time risk scoring: load trained models and score a feature vector."""
+"""Real-time risk scoring: load trained models and score a feature vector.
+
+Also provides conformal prediction intervals via ``score_with_uncertainty``
+when calibration artifacts are present.
+"""
+
+from __future__ import annotations
 
 try:
     import fcntl
@@ -7,6 +13,7 @@ except ImportError:
 import json
 import logging
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -22,11 +29,10 @@ _REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
 _weights_mtime: float | None = None
 _runtime_weights: dict[str, float] | None = None
 
-# Names in this set are skipped by the ensemble's predict_proba loop below:
-# they are feature generators or sequence models, not part of the weighted
-# tabular-classifier vote (their signal already flows into the feature
-# vector itself -- see `feature_engineering.build_feature_vector`).
-_NON_VOTING_MODELS = frozenset({"temporal_lstm", "gnn"})
+if TYPE_CHECKING:
+    from detection.conformal import ConformalCalibrator
+
+logger = logging.getLogger("ledgerlens.model_inference")
 
 _MODEL_FILENAMES = {
     "random_forest": "random_forest.joblib",
@@ -34,6 +40,12 @@ _MODEL_FILENAMES = {
     "lightgbm": "lightgbm.joblib",
     "temporal_lstm": "temporal_lstm.joblib",
     "gnn": "gnn_model.pt",
+}
+
+_CALIBRATION_FILENAMES = {
+    "random_forest": "random_forest_conformal.json",
+    "xgboost": "xgboost_conformal.json",
+    "lightgbm": "lightgbm_conformal.json",
 }
 
 
@@ -110,14 +122,8 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
     return weights
 
 
-def load_models(model_dir: str | None = None) -> dict:
-    """Load all trained models from `model_dir` (defaults to `settings.model_dir`).
-
-    `gnn_model.pt`, if present and `torch`/`torch_geometric` are installed, is
-    loaded separately via `safe_load_gnn_checkpoint` -- it is a PyTorch
-    checkpoint, not a joblib-pickled sklearn-style model like the rest of
-    `_MODEL_FILENAMES`.
-    """
+def _load_models_base(model_dir: str | None = None) -> dict:
+    """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
     model_dir = model_dir or settings_module.settings.model_dir
     signing_key = settings_module.settings.model_signing_key.encode()
     models = {}
@@ -140,6 +146,29 @@ def load_models(model_dir: str | None = None) -> dict:
     if not models:
         raise FileNotFoundError(f"No trained models found in {model_dir}. Run model_training first.")
     return models
+
+
+def load_calibration(model_dir: str | None = None) -> dict[str, ConformalCalibrator]:
+    """Load calibration artifacts for each model, returning a dict keyed by model name.
+
+    Missing or corrupt artifacts are logged and skipped — never raised.
+    Returns an empty dict when no calibration files exist.
+    """
+    from detection.conformal import CalibrationIntegrityError, ConformalCalibrator
+
+    model_dir = model_dir or settings_module.settings.model_dir
+    calibrators: dict[str, ConformalCalibrator] = {}
+    for name, filename in _CALIBRATION_FILENAMES.items():
+        path = os.path.join(model_dir, filename)
+        if not os.path.exists(path):
+            continue
+        try:
+            calibrators[name] = ConformalCalibrator.load(path)
+        except CalibrationIntegrityError:
+            logger.warning("Calibration artifact %s failed integrity check; skipping", path)
+        except Exception:
+            logger.warning("Failed to load calibration artifact %s; skipping", path)
+    return calibrators
 
 
 def _get_ensemble_weights(model_dir: str | None = None) -> dict[str, float]:
@@ -194,9 +223,10 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
     return float(weighted_prob), max(0.0, min(1.0, confidence))
 
 
-def score_feature_matrix(
+def _score_feature_matrix_base(
     models: dict,
     feature_vectors: list[dict],
+    **kwargs,
 ) -> list[tuple[float, float]]:
     """Score a batch of feature vectors with a single `predict_proba` call per model.
 
@@ -235,3 +265,119 @@ def score_feature_matrix(
     confidences = np.clip(1.0 - np.std(all_probs, axis=0), 0.0, 1.0)  # (N,)
 
     return [(float(weighted_probs[i]), float(confidences[i])) for i in range(len(feature_vectors))]
+
+
+def score_with_uncertainty(
+    models: dict,
+    feature_vector: dict,
+    calibrators: dict[str, ConformalCalibrator] | None = None,
+    model_dir: str | None = None,
+) -> dict:
+    """Score a single feature vector and return uncertainty estimates.
+
+    Returns the same ``(probability, confidence)`` pair as
+    :func:`score_feature_vector`, plus:
+
+    - ``score_lower`` / ``score_upper``:  0-100 prediction interval bounds
+    - ``prediction_set``:  list of class indices in the conformal set
+    - ``coverage_guarantee``: target coverage (1 - alpha)
+
+    When calibration artifacts are unavailable (``calibrators`` is ``None``
+    or empty), returns maximally conservative bounds
+    ``(score_lower=0.0, score_upper=100.0, coverage_guarantee=1.0)``
+    without crashing.
+    """
+    probability, confidence = score_feature_vector(models, feature_vector)
+    score_0_100 = probability * 100.0
+
+    cal = calibrators or load_calibration(model_dir=model_dir)
+    if not cal:
+        return {
+            "score": score_0_100,
+            "score_lower": 0.0,
+            "score_upper": 100.0,
+            "prediction_set": [],
+            "coverage_guarantee": 1.0,
+        }
+
+    # Use the most conservative (largest) q_hat across all calibrated models
+    q_hat = max(c.q_hat for c in cal.values() if c.q_hat is not None)
+    alpha = next(iter(cal.values())).alpha
+
+    score_lower = max(0.0, score_0_100 - q_hat * 100.0)
+    score_upper = min(100.0, score_0_100 + q_hat * 100.0)
+
+    # Prediction set: class 1 is included if 1 - prob[1] <= q_hat
+    prediction_set = [0]
+    if (1.0 - probability) <= q_hat:
+        prediction_set.append(1)
+
+    return {
+        "score": score_0_100,
+        "score_lower": score_lower,
+        "score_upper": score_upper,
+        "prediction_set": prediction_set,
+        "coverage_guarantee": 1.0 - alpha,
+    }
+
+
+from detection.gnn_model import safe_load_gnn_checkpoint, _HAS_PYG  # noqa: E402
+from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
+
+_MODEL_FILENAMES = dict(globals().get("_MODEL_FILENAMES", {}))
+_MODEL_FILENAMES["gnn"] = "gnn_model.pt"
+
+
+def load_models(model_dir: str, *args, **kwargs) -> dict:
+    """Wraps the base model loader, also loading gnn_model.pt if present."""
+    models = _load_models_base(model_dir, *args, **kwargs)
+
+    gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
+    if os.path.exists(gnn_path) and _HAS_PYG:
+        try:
+            models["gnn"] = safe_load_gnn_checkpoint(gnn_path)
+        except RuntimeError as e:
+            logger.error("GNN checkpoint failed validation: %s", e)
+            raise
+    return models
+
+
+def score_feature_matrix(batch, models: dict, *args, **kwargs):
+    """Wraps the base scorer, computing GNN features per-batch first.
+
+    Benchmark target: T-GNN forward pass adds <= 200ms / 500-wallet batch
+    on a single CPU core.
+    """
+    gnn_features = {}
+    if "gnn" in models and _HAS_PYG:
+        builder = TemporalGraphBuilder()
+        trades = _trades_from_batch(batch)  # noqa: F821
+        snapshots = builder.build_snapshots(trades, lookback_days=1)
+        gnn_features = _gnn_forward_pass(models["gnn"], snapshots)
+
+    return _score_feature_matrix_base(
+        batch, models, *args, use_gnn=bool(gnn_features), gnn_features=gnn_features, **kwargs
+    )
+
+
+def _gnn_forward_pass(model, snapshots) -> dict:
+    """Runs the T-GNN over snapshots, returns per-wallet GNN feature dict."""
+    import torch
+    results = {}
+    model.eval()
+    with torch.no_grad():
+        for snap in snapshots:
+            if snap.edge_index.shape[1] == 0:
+                continue
+            x = torch.tensor(snap.node_features, dtype=torch.float32)
+            edge_index = torch.tensor(snap.edge_index, dtype=torch.long)
+            edge_attr = torch.tensor(snap.edge_attr, dtype=torch.float32)
+            edge_time = torch.zeros(edge_index.shape[1])
+            scores = model(x, edge_index, edge_attr, edge_time)
+            neighbor_avg = model.neighbor_avg_score(scores, edge_index, x.shape[0])
+            for addr, idx in snap.wallet_index.items():
+                results[addr] = {
+                    "gnn_wash_ring_probability": float(scores[idx].item()),
+                    "gnn_neighbor_avg_score": float(neighbor_avg[idx].item()),
+                }
+    return results

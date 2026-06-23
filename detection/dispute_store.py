@@ -157,6 +157,7 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
         conn.commit()
 
         # Check quorum
+        member_count = conn.execute("SELECT COUNT(*) FROM committee_members").fetchone()[0]  # noqa: F841
         quorum = getattr(settings, "COMMITTEE_QUORUM", 3)
         if len(votes) >= quorum:
             approves = sum(1 for v in votes if v.get("vote") == "approve")

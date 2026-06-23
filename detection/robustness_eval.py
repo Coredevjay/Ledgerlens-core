@@ -271,3 +271,77 @@ def compute_robustness_report(models: dict, df, n_samples: int = 200, epsilon: f
         pass
 
     return report
+
+
+# ---------------------------------------------------------------------------
+# Live red team metrics
+#
+# These read the evasion-event log written by the continuous red team loop
+# (detection.red_team) and summarise how the model is currently holding up
+# against the adversarial attacker. Exposed via GET /api/v1/model/robustness.
+# ---------------------------------------------------------------------------
+
+
+def evasion_rate_24h(db_path: str | None = None) -> float:
+    """Fraction of seed attacks in the last 24h that successfully evaded.
+
+    Returns ``0.0`` when no attacks were logged in the window.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from detection.red_team.evasion_logger import get_evasion_events
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    events = get_evasion_events(since=since, db_path=db_path)
+    if not events:
+        return 0.0
+    evaded = sum(1 for e in events if e["is_evasion"])
+    return float(evaded / len(events))
+
+
+def mean_generations_to_evade(db_path: str | None = None) -> float:
+    """Average GA generations needed across successful evasions (``0.0`` if none)."""
+    from detection.red_team.evasion_logger import get_evasion_events
+
+    events = [e for e in get_evasion_events(only_evasions=True, db_path=db_path)]
+    if not events:
+        return 0.0
+    return float(np.mean([e["attacker_generation"] for e in events]))
+
+
+def _evasion_rate(events: list[dict]) -> float:
+    if not events:
+        return 0.0
+    return float(sum(1 for e in events if e["is_evasion"]) / len(events))
+
+
+def hardening_delta(db_path: str | None = None) -> float:
+    """Change in evasion rate from before to after the most recent retrain.
+
+    Positive means evasions became *more* frequent after retraining (a
+    regression); negative means hardening reduced the evasion rate. Returns
+    ``0.0`` when there is no recorded retrain to split the log on.
+    """
+    from detection.red_team.evasion_logger import get_evasion_events
+    from detection.storage import get_retrain_runs
+
+    runs = get_retrain_runs(limit=1, db_path=db_path)
+    if not runs:
+        return 0.0
+    retrain_ts = runs[0]["triggered_at"]
+
+    events = get_evasion_events(db_path=db_path)
+    before = [e for e in events if e["created_at"] < retrain_ts]
+    after = [e for e in events if e["created_at"] >= retrain_ts]
+    if not before or not after:
+        return 0.0
+    return _evasion_rate(after) - _evasion_rate(before)
+
+
+def live_robustness_metrics(db_path: str | None = None) -> dict:
+    """Aggregate the live red team metrics surfaced by the robustness endpoint."""
+    return {
+        "evasion_rate_24h": evasion_rate_24h(db_path=db_path),
+        "mean_generations_to_evade": mean_generations_to_evade(db_path=db_path),
+        "hardening_delta": hardening_delta(db_path=db_path),
+    }
