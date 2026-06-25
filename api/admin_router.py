@@ -178,3 +178,48 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# PSI heatmap & history endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/psi-heatmap", include_in_schema=False)
+def psi_heatmap(days: int = 90):
+    """Return the most recently generated PSI heatmap as a PNG image."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    from detection.drift_monitor import export_psi_heatmap
+
+    heatmap_dir = Path(settings.model_dir) / "psi_heatmaps"
+    heatmap_dir.mkdir(parents=True, exist_ok=True)
+    heatmap_path = heatmap_dir / "latest_heatmap.png"
+
+    export_psi_heatmap(heatmap_path, days_back=days)
+    return FileResponse(str(heatmap_path), media_type="image/png")
+
+
+@router.get("/psi-history", include_in_schema=False)
+def psi_history(
+    feature: str | None = None,
+    days: int = 30,
+) -> list[dict]:
+    """Return per-feature PSI history records."""
+    from detection.drift_monitor import load_psi_history
+
+    df = load_psi_history(days_back=days)
+    if df.empty:
+        return []
+
+    if feature:
+        df = df[df["feature_name"] == feature]
+
+    return [
+        {
+            "feature_name": row["feature_name"],
+            "psi_value": row["psi_value"],
+            "computed_at": row["computed_at"],
+        }
+        for _, row in df.iterrows()
+    ]

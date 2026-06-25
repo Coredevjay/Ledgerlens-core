@@ -145,7 +145,13 @@ def retrain_check(
 
     from config.settings import settings
     from detection.dataset import build_training_dataset
-    from detection.drift_monitor import is_drift_detected, run_drift_report
+    from detection.drift_monitor import (
+        check_psi_and_alert,
+        compute_per_feature_psi,
+        is_drift_detected,
+        record_psi_snapshot,
+        run_drift_report,
+    )
     from detection.model_registry import (
         get_current_version,
         rollback_model,
@@ -172,6 +178,17 @@ def retrain_check(
         return
 
     logger.info("Drift report: %s", report)
+
+    # Per-feature PSI tracking
+    try:
+        psi_dict = compute_per_feature_psi(training_dataset_path)
+        record_psi_snapshot(psi_dict)
+        check_psi_and_alert(psi_dict, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
+        logger.info("Per-feature PSI: %d features computed", len(psi_dict))
+    except FileNotFoundError as exc:
+        logger.warning("Per-feature PSI skipped: %s", exc)
+    except Exception as exc:
+        logger.warning("Per-feature PSI computation failed: %s", exc)
 
     # Check if drift detected
     drift_detected = is_drift_detected(report, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
@@ -285,12 +302,16 @@ def retrain_check(
     os.makedirs(drift_report_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     report_path = os.path.join(drift_report_dir, f"{timestamp}.json")
+    drifted_features = [f for f, v in report.items() if v > psi_threshold]
     with open(report_path, "w") as f:
         json.dump(
             {
                 "timestamp": timestamp,
                 "drift_detected": drift_detected,
+                "n_drifted_features": len(drifted_features),
                 "psi_report": report,
+                "per_feature_psi": report,
+                "drifted_features": drifted_features,
                 "promoted": promoted,
                 "new_model_metrics": {k: v.get("auc_roc") for k, v in new_results.items()},
             },
