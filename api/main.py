@@ -19,11 +19,14 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +40,12 @@ from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.namespace import list_namespaces
 from config.settings import settings
+from detection.tracing import (
+    configure_tracing,
+    extract_context_from_headers,
+    get_tracer,
+    start_span,
+)
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
@@ -65,6 +74,41 @@ logger = logging.getLogger("ledgerlens.api")
 
 _STELLAR_ADDRESS_PATTERN = re.compile(r"^G[A-Z2-7]{55}$")
 
+# ---------------------------------------------------------------------------
+# Simple in-process IP rate limiter for the causal-explanation endpoint.
+# Limit: 10 requests per minute per IP (token-bucket style).
+# ---------------------------------------------------------------------------
+_CAUSAL_RATE_LIMIT = 10         # max requests per window
+_CAUSAL_RATE_WINDOW = 60.0      # window size in seconds
+_causal_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_causal_rate_limit(client_ip: str) -> None:
+    """Raise HTTP 429 if ``client_ip`` has exceeded the causal-explanation rate limit.
+
+    Uses a sliding window: only timestamps within the last 60 seconds are counted.
+    """
+    now = time.monotonic()
+    bucket = _causal_rate_buckets[client_ip]
+    # Evict timestamps outside the window
+    _causal_rate_buckets[client_ip] = [t for t in bucket if now - t < _CAUSAL_RATE_WINDOW]
+    if len(_causal_rate_buckets[client_ip]) >= _CAUSAL_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: causal-explanation endpoint allows "
+                f"{_CAUSAL_RATE_LIMIT} requests per minute per IP."
+            ),
+        )
+    _causal_rate_buckets[client_ip].append(now)
+
+
+# ---------------------------------------------------------------------------
+# Causal engine singleton — fitted lazily on first request.
+# ---------------------------------------------------------------------------
+_causal_engine = None
+_causal_engine_lock = __import__("threading").Lock()
+
 
 def validate_stellar_address(wallet: str) -> None:
     """Validate that `wallet` is a valid Stellar account ID.
@@ -89,6 +133,7 @@ _models: dict = {}
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; close WebSocket connections at shutdown."""
     global _models
+    configure_tracing()
     try:
         from detection.model_inference import load_models
         _models = load_models(settings.model_dir)
@@ -107,6 +152,20 @@ app = FastAPI(
     version="1.0.0",
     lifespan=_lifespan,
 )
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_operational_error_handler(request: Request, exc: sqlite3.OperationalError):
+    """Return 503 with Retry-After when SQLite is locked or unavailable."""
+    logger.error("SQLite operational error: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database temporarily unavailable. Please retry."},
+        headers={"Retry-After": "5"},
+    )
+
+
+app.include_router(analyst_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -152,45 +211,73 @@ v1_router = APIRouter(prefix="/v1")
 
 @v1_router.get("/health")
 def health() -> JSONResponse:
-    """Returns 200 when healthy, 503 when any component check fails.
+    """Returns 200 when healthy, 503 when any hard-failure component check fails.
 
     Checks:
     - DB connectivity: executes SELECT 1 via the existing _connect helper.
     - Model files: each expected .joblib file exists and is non-empty.
+    - Circuit breakers: Horizon ingestion and the Redis feature store each
+      have a breaker (see `utils.circuit_breaker`). An OPEN/HALF_OPEN
+      circuit marks the response "degraded" but keeps returning 200 (the
+      service is still serving traffic in a reduced-functionality state,
+      not failed) — only DB/model failures return 503.
 
     The response body names every component but never leaks local filesystem
     paths — errors are logged server-side at ERROR level.
     """
     from detection.model_inference import _MODEL_FILENAMES
     from detection.storage import _connect
+    from ingestion.horizon_streamer import horizon_circuit
+    from utils.circuit_breaker import CircuitState
 
-    status: dict[str, str] = {}
+    status: dict[str, object] = {}
     healthy = True
+    degraded = False
 
     # --- DB check ---
-    try:
-        with _connect() as conn:
-            conn.execute("SELECT 1")
-        status["db"] = "ok"
-    except sqlite3.Error as exc:
-        logger.error("Health check: DB connectivity failure: %s", exc)
-        status["db"] = "error: database unreachable"
-        healthy = False
+    with start_span("db.health_check"):
+        try:
+            with _connect() as conn:
+                conn.execute("SELECT 1")
+            status["db"] = "ok"
+        except sqlite3.Error as exc:
+            logger.error("Health check: DB connectivity failure: %s", exc)
+            status["db"] = "error: database unreachable"
+            healthy = False
 
     # --- Model files check (existence + non-zero size only; no deserialization) ---
-    missing = [
-        name
-        for name, filename in _MODEL_FILENAMES.items()
-        if not _model_file_ok(os.path.join(settings.model_dir, filename))
-    ]
+    with start_span("models.health_check"):
+        missing = [
+            name
+            for name, filename in _MODEL_FILENAMES.items()
+            if not _model_file_ok(os.path.join(settings.model_dir, filename))
+        ]
     if missing:
         status["models"] = f"missing: {', '.join(sorted(missing))}"
         healthy = False
     else:
         status["models"] = "ok"
 
-    status["status"] = "ok" if healthy else "degraded"
-    http_status = 200 if healthy else 503
+    # --- Circuit breakers (open/half-open => degraded, not failed) ---
+    try:
+        feature_store_circuit_state = _get_health_feature_store().circuit_state
+    except Exception as exc:
+        logger.error("Health check: feature store circuit lookup failed: %s", exc)
+        feature_store_circuit_state = CircuitState.OPEN.value
+    circuits = {
+        "horizon": horizon_circuit.state.value,
+        "feature_store_redis": feature_store_circuit_state,
+    }
+    status["circuits"] = circuits
+    if any(state != CircuitState.CLOSED.value for state in circuits.values()):
+        degraded = True
+
+    if healthy:
+        status["status"] = "degraded" if degraded else "ok"
+        http_status = 200
+    else:
+        status["status"] = "degraded"
+        http_status = 503
     return JSONResponse(content=status, status_code=http_status)
 
 
@@ -262,13 +349,54 @@ def explain_wallet_score(
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
+    with start_span("redis.shap_lookup", attributes={"wallet": wallet, "asset_pair": asset_pair}):
+        cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
     if cached is None:
         raise HTTPException(
             status_code=404,
             detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
         )
     return cached
+
+
+class RateLimiterStatus(BaseModel):
+    configured_rate: float
+    current_rate: float
+    bucket_level: float
+    backpressure_active: bool
+    queue_size: int
+    last_429_at: Optional[datetime] = None
+
+
+@app.get(
+    "/stream/rate-limiter",
+    response_model=RateLimiterStatus,
+    dependencies=[Depends(require_admin_key)],
+)
+def rate_limiter_status() -> RateLimiterStatus:
+    """Return current rate limiter and backpressure state.
+
+    Requires the ``X-LedgerLens-Admin-Key`` header.  Returns 503 if no
+    streamer is currently registered.
+    """
+    bucket = _stream_rate_limiter_state.get("bucket")
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Rate limiter not active (no streamer running)")
+
+    bp = _stream_rate_limiter_state.get("backpressure")
+    adaptive = _stream_rate_limiter_state.get("adaptive")
+    last_429_dt: Optional[datetime] = None
+    if adaptive and adaptive.last_429_at is not None:
+        last_429_dt = datetime.fromtimestamp(adaptive.last_429_at, tz=timezone.utc)
+
+    return RateLimiterStatus(
+        configured_rate=bucket.current_rate,
+        current_rate=bucket.current_rate,
+        bucket_level=bucket.bucket_level,
+        backpressure_active=bp.is_paused if bp else False,
+        queue_size=bp.queue_size if bp else 0,
+        last_429_at=last_429_dt,
+    )
 
 
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
@@ -311,7 +439,8 @@ def wallet_counterfactual(
     from detection.model_inference import score_feature_vector
 
     resolved_target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
-    current_probability, _confidence = score_feature_vector(_models, feature_vector)
+    with start_span("model.inference", attributes={"wallet": wallet}):
+        current_probability, _confidence = score_feature_vector(_models, feature_vector)
     current_score = round(current_probability * 100)
 
     future = _counterfactual_executor.submit(
@@ -470,6 +599,19 @@ def circular_path_payments(
 ) -> list[dict]:
     """Return detected atomic circular path-payment routes, paginated."""
     return get_circular_routes(limit=limit, offset=offset)
+
+
+@app.get("/path-cycles")
+def list_path_cycles(
+    min_score: float = Query(0.6, ge=0.0, le=1.0),
+    wallet: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+) -> list[dict]:
+    """Return detected multi-hop path-payment wash-trade cycles."""
+    from detection.storage import get_hop_payment_cycles
+    if wallet is not None:
+        validate_stellar_address(wallet)
+    return get_hop_payment_cycles(min_score=min_score, wallet=wallet, limit=limit)
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +902,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 
 
 # ------------------------------------------------------------------
-# Governance
+# ZK Commitment endpoints (#147)
 # ------------------------------------------------------------------
 
 
@@ -769,7 +911,7 @@ def get_proposals():
     return [p.dict() for p in list_open_proposals()]
 
 
-class ProposalCreate(BaseModel):
+class LegacyProposalCreate(BaseModel):
     proposal_type: str
     proposed_value: str
     proposed_by_key_hash: str
@@ -784,7 +926,7 @@ def create_proposal_endpoint(body: ProposalCreate):
     return p.dict()
 
 
-class ProposalVote(BaseModel):
+class LegacyProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
@@ -869,6 +1011,323 @@ def compliance_audit_trail(wallet: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Causal explanation endpoint
+# ---------------------------------------------------------------------------
+
+# Valid feature names accepted by the feature_override parameter.
+_CAUSAL_FEATURE_NAMES_SET: frozenset[str] = frozenset([
+    "wash_ring_membership",
+    "round_trip_trade_frequency",
+    "chi_sq_24h",
+    "cycle_volume_ratio",
+    "volume_to_unique_counterparty_ratio",
+    "network_centrality",
+    "account_age_days",
+    "gnn_wash_ring_prob",
+])
+
+# Value range for feature overrides (validated for security).
+_FEATURE_OVERRIDE_MIN = -1000.0
+_FEATURE_OVERRIDE_MAX = 1000.0
+
+# Refutation gate: if more than this many features have placebo p-value < 0.05,
+# refuse to serve the ATE table and return 503.
+_MAX_FAILING_REFUTATIONS = 3
+
+
+class CausalExplanationResponse(BaseModel):
+    """Response schema for GET /scores/{wallet}/causal-explanation."""
+
+    wallet: str
+    current_score: int
+    feature_ate_table: dict[str, float]
+    top_causal_features: list[tuple[str, float]]
+    counterfactual_score: Optional[float]
+    coverage_note: str
+
+
+def _parse_feature_override(raw: str | None) -> tuple[str, float] | None:
+    """Parse and strictly validate a ``feature=value`` override string.
+
+    Returns ``(feature_name, value)`` on success or raises ``HTTPException``
+    with status 422 on any validation failure.
+
+    Security requirements:
+    - Feature name must be a known observable feature (not arbitrary user input).
+    - Value must be a finite float within [-1000, 1000].
+    """
+    if raw is None:
+        return None
+    if "=" not in raw:
+        raise HTTPException(
+            status_code=422,
+            detail="feature_override must be in 'feature=value' format (e.g. 'wash_ring_membership=0.0').",
+        )
+    feature, _, value_str = raw.partition("=")
+    feature = feature.strip()
+    value_str = value_str.strip()
+
+    if feature not in _CAUSAL_FEATURE_NAMES_SET:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown feature '{feature}'. "
+                f"Valid features: {sorted(_CAUSAL_FEATURE_NAMES_SET)}"
+            ),
+        )
+    try:
+        value = float(value_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Feature override value '{value_str}' is not a valid number.",
+        )
+    import math
+    if not math.isfinite(value):
+        raise HTTPException(
+            status_code=422,
+            detail="Feature override value must be a finite number.",
+        )
+    if value < _FEATURE_OVERRIDE_MIN or value > _FEATURE_OVERRIDE_MAX:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Feature override value {value} is out of range "
+                f"[{_FEATURE_OVERRIDE_MIN}, {_FEATURE_OVERRIDE_MAX}]."
+            ),
+        )
+    return feature, value
+
+
+def _get_or_fit_causal_engine():
+    """Return the global CausalEngine, fitting lazily from stored scores if needed.
+
+    Thread-safe via a module-level lock.  Returns None when insufficient data
+    is available (< CAUSAL_MIN_SAMPLE_SIZE scored wallets in the database).
+    """
+    global _causal_engine
+    if _causal_engine is not None and _causal_engine.is_fitted():
+        return _causal_engine
+
+    with _causal_engine_lock:
+        if _causal_engine is not None and _causal_engine.is_fitted():
+            return _causal_engine
+
+        try:
+            from detection.causal_engine import CausalEngine, build_causal_dag, OBSERVABLE_FEATURE_NODES
+            from detection.storage import _connect
+            import os
+
+            min_sample = int(os.getenv("CAUSAL_MIN_SAMPLE_SIZE", "500"))
+            method = os.getenv("CAUSAL_ESTIMATION_METHOD", "backdoor.linear_regression")
+            refutation_runs = int(os.getenv("CAUSAL_REFUTATION_RUNS", "100"))
+            model_version = os.getenv("LEDGERLENS_MODEL_VERSION", "default")
+
+            with _connect() as conn:
+                rows = conn.execute(
+                    "SELECT wallet, asset_pair, score, shap_json FROM risk_scores "
+                    "ORDER BY id DESC LIMIT 5000"
+                ).fetchall()
+
+            if len(rows) < min_sample:
+                logger.warning(
+                    "Causal engine: only %d scored wallets available (minimum %d). "
+                    "Returning None.",
+                    len(rows),
+                    min_sample,
+                )
+                return None
+
+            # Build a DataFrame from stored scores + shap_json feature proxies
+            records = []
+            for wallet_addr, asset_pair, score, shap_json_str in rows:
+                record: dict = {"risk_score": float(score)}
+                if shap_json_str:
+                    try:
+                        shap_data = json.loads(shap_json_str)
+                        for item in shap_data:
+                            feat = item.get("feature", "")
+                            if feat in _CAUSAL_FEATURE_NAMES_SET:
+                                record[feat] = float(item.get("shap_value", 0.0))
+                    except Exception:
+                        pass
+                records.append(record)
+
+            import pandas as pd
+            df = pd.DataFrame(records)
+            for feat in OBSERVABLE_FEATURE_NODES:
+                if feat not in df.columns:
+                    df[feat] = 0.0
+            df = df.fillna(0.0)
+
+            engine = CausalEngine(
+                dag=build_causal_dag(),
+                estimation_method=method,
+                db_path=settings.db_path,
+                model_version=model_version,
+                refutation_runs=refutation_runs,
+                min_sample_size=min_sample,
+            )
+            engine.fit(df)
+            _causal_engine = engine
+            return _causal_engine
+
+        except Exception as exc:
+            logger.error("Failed to fit CausalEngine: %s", exc)
+            return None
+
+
+@app.get("/scores/{wallet}/causal-explanation", response_model=CausalExplanationResponse)
+def causal_explanation(
+    request: Request,
+    wallet: str,
+    feature_override: Optional[str] = Query(
+        default=None,
+        description=(
+            "Optional feature override in 'feature=value' format. "
+            "Returns counterfactual_score with the override applied. "
+            "Example: 'wash_ring_membership=0.0'"
+        ),
+    ),
+) -> CausalExplanationResponse:
+    """Return a causal explanation of the risk score for ``wallet``.
+
+    Unlike SHAP, which conflates causal and correlational contributions, this
+    endpoint returns *causal* average treatment effects (ATEs) estimated via
+    do-calculus interventions on the fitted structural causal model.
+
+    Response fields
+    ---------------
+    - ``feature_ate_table``: ATE of each feature on risk_score — the expected
+      change in score if that feature alone is moved from 0 to 1.
+    - ``top_causal_features``: top-3 features by absolute ATE.
+    - ``counterfactual_score``: predicted score if ``feature_override`` were
+      applied (only present when ``feature_override`` is supplied).
+    - ``coverage_note``: advisory note about sample size and estimate quality.
+
+    Security
+    --------
+    - ``feature_override`` is strictly validated: feature must be a known
+      observable feature name; value must be a finite float in [-1000, 1000].
+    - Rate-limited to 10 requests per minute per IP.
+    - ``counterfactual_score`` is not cached publicly to prevent fingerprinting
+      the model's sensitivity surface.
+
+    Errors
+    ------
+    - **400** — invalid Stellar wallet address format.
+    - **404** — no scores found for the wallet.
+    - **422** — invalid ``feature_override`` format or value.
+    - **429** — rate limit exceeded (10 req/min per IP).
+    - **503** — causal model not available (insufficient training data, DoWhy
+      not installed, or refutation gate triggered).
+    """
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    _check_causal_rate_limit(client_ip)
+
+    validate_stellar_address(wallet)
+
+    # Validate feature_override parameter before any expensive work
+    override_parsed = _parse_feature_override(feature_override)
+
+    # Fetch current score
+    scores = get_latest_scores(wallet=wallet)
+    if not scores:
+        raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
+    current_score = scores[0].score
+
+    # Get or fit the causal engine
+    engine = _get_or_fit_causal_engine()
+    if engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Causal model is not available. Either the database has fewer than "
+                "CAUSAL_MIN_SAMPLE_SIZE scored wallets, or DoWhy is not installed "
+                "(pip install dowhy==0.11.1), or the refutation gate was triggered. "
+                "Check server logs for details."
+            ),
+        )
+
+    # Fetch the ATE table (uses cache when available)
+    ate_table = engine.feature_ate_table(use_cache=True)
+
+    # Refutation gate: if the model appears misspecified, refuse to serve ATEs
+    try:
+        refutation_results = engine.refutation_tests()
+        failing = sum(
+            1 for k, pval in refutation_results.items()
+            if k == "placebo_treatment_refuter" and pval < 0.05
+        )
+        # A stricter check: if any refutation test fails for more than
+        # _MAX_FAILING_REFUTATIONS features, refuse
+        all_failing = sum(1 for pval in refutation_results.values() if pval < 0.05)
+        if all_failing > _MAX_FAILING_REFUTATIONS:
+            logger.error(
+                "Causal model refutation gate triggered: %d tests have p < 0.05 "
+                "(threshold: %d). Refusing to serve ATE table.",
+                all_failing,
+                _MAX_FAILING_REFUTATIONS,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Causal model appears misspecified: {all_failing} refutation tests "
+                    f"returned p < 0.05 (threshold: {_MAX_FAILING_REFUTATIONS}). "
+                    "The causal graph may not fit the current data distribution. "
+                    "Please retrain or investigate model specification."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Refutation failures are logged but don't block the response
+        logger.warning("Refutation tests raised an exception: %s", exc)
+
+    # Top-3 features by absolute ATE
+    sorted_features = sorted(ate_table.items(), key=lambda x: abs(x[1]), reverse=True)
+    top_causal_features = sorted_features[:3]
+
+    # Counterfactual score
+    counterfactual_score_value: Optional[float] = None
+    if override_parsed is not None:
+        feature_name, feature_value = override_parsed
+        wallet_features = get_feature_vector_for_wallet(wallet, scores[0].asset_pair)
+        if wallet_features is not None:
+            counterfactual_score_value = engine.counterfactual_score(
+                wallet_features=wallet_features,
+                overrides={feature_name: feature_value},
+            )
+        else:
+            # Fall back to score-based approximation
+            counterfactual_score_value = engine.counterfactual_score(
+                wallet_features={"risk_score": float(current_score)},
+                overrides={feature_name: feature_value},
+            )
+
+    # Determine sample size for coverage note
+    try:
+        from detection.storage import _connect
+        with _connect() as conn:
+            n_wallets = conn.execute("SELECT COUNT(*) FROM risk_scores").fetchone()[0]
+    except Exception:
+        n_wallets = 0
+
+    coverage_note = (
+        f"Based on {n_wallets} scored wallets; causal estimates may be noisy "
+        "when sample size is below 500 or when the wallet's feature profile is "
+        "unusual relative to the training distribution."
+    )
+
+    return CausalExplanationResponse(
+        wallet=wallet,
+        current_score=current_score,
+        feature_ate_table=ate_table,
+        top_causal_features=top_causal_features,
+        counterfactual_score=counterfactual_score_value,
+        coverage_note=coverage_note,
+    )
 # Mount versioned router and register legacy 302 redirect aliases
 # ---------------------------------------------------------------------------
 
