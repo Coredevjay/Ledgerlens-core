@@ -23,6 +23,8 @@ class Settings:
     trade_history_lookback_days: int = field(default_factory=lambda: int(os.getenv("TRADE_HISTORY_LOOKBACK_DAYS", "30")))
 
     benford_mad_threshold: float = field(default_factory=lambda: float(os.getenv("BENFORD_MAD_THRESHOLD", "0.015")))
+    benford_min_sample_count: int = field(default_factory=lambda: int(os.getenv("BENFORD_MIN_SAMPLE_COUNT", "30")))
+    benford_max_window_days: int = field(default_factory=lambda: int(os.getenv("BENFORD_MAX_WINDOW_DAYS", "90")))
     _default_risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
     COMMITTEE_QUORUM: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_QUORUM", "3")))
     COMMITTEE_VOTE_DEADLINE_DAYS: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_VOTE_DEADLINE_DAYS", "14")))
