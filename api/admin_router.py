@@ -178,3 +178,76 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/red-team/latest  (Issue-133)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/red-team/latest", include_in_schema=False)
+def get_latest_red_team_report(report_dir: str = "./red_team_reports") -> dict:
+    """Return the most recent red-team campaign summary JSON."""
+    import json as _json
+    report_files = sorted(glob.glob(os.path.join(report_dir, "*.json")))
+    if not report_files:
+        raise HTTPException(status_code=404, detail="No red-team campaign reports found")
+    with open(report_files[-1], "r", encoding="utf-8") as fh:
+        return _json.load(fh)
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/drift-reports/latest  (Issue-135)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/drift-reports/latest", include_in_schema=False)
+def get_latest_drift_report() -> dict:
+    """Return the most recent per-feature PSI drift report."""
+    from detection.drift_monitor import DriftMonitor
+    monitor = DriftMonitor(db_path=settings.db_path)
+    return monitor.get_latest_report()
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/ensemble-weights  (Issue-136)
+# GET /admin/label-feedback
+# POST /admin/label-feedback
+# ---------------------------------------------------------------------------
+
+
+class LabelFeedbackRequest(BaseModel):
+    wallet: str
+    asset_pair: str
+    true_label: int
+    model_scores: dict[str, float]
+    ensemble_score: int
+    analyst_id: str
+
+
+@router.get("/ensemble-weights", include_in_schema=False)
+def get_ensemble_weights() -> dict:
+    """Return current adaptive ensemble weights."""
+    from detection.adaptive_reweighter import AdaptiveReweighter
+    reweighter = AdaptiveReweighter(db_path=settings.db_path)
+    return {"weights": reweighter.current_weights(), "updated_at": datetime.now(timezone.utc).isoformat()}
+
+
+@router.post("/label-feedback", include_in_schema=False)
+def submit_label_feedback(body: LabelFeedbackRequest) -> dict:
+    """Submit analyst-confirmed label feedback and update ensemble weights."""
+    from detection.adaptive_reweighter import AdaptiveReweighter, LabelFeedback
+    if body.true_label not in (0, 1):
+        raise HTTPException(status_code=422, detail="true_label must be 0 or 1")
+    feedback = LabelFeedback(
+        wallet=body.wallet,
+        asset_pair=body.asset_pair,
+        true_label=body.true_label,
+        model_scores=body.model_scores,
+        ensemble_score=body.ensemble_score,
+        analyst_id=body.analyst_id,
+    )
+    reweighter = AdaptiveReweighter(db_path=settings.db_path)
+    reweighter.record_feedback(feedback)
+    reweighter.update_weights()
+    return {"status": "accepted", "weights": reweighter.current_weights()}

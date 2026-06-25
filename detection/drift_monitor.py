@@ -11,6 +11,10 @@ model degradation over time. When F1 drops more than 5 percentage points from
 the training baseline, ``ModelDegradationAlert`` is raised and retraining is
 triggered automatically.
 
+Per-feature PSI alerting (Issue-135): :class:`DriftMonitor` tracks PSI
+time-series per feature, applies a three-tier escalation system (WARNING /
+ERROR / CRITICAL), and fires webhooks when any feature exceeds PSI > 0.25.
+
 Feedback collection loop architecture:
   1. Analyst submits label via ``POST /performance/feedback``
   2. Label written to ``feedback_labels`` table via :meth:`PerformanceMonitor.record_feedback`
@@ -20,8 +24,9 @@ Feedback collection loop architecture:
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -601,3 +606,234 @@ class PerformanceMonitor:
             }
             for r in rows
         ]
+
+
+# ---------------------------------------------------------------------------
+# Per-feature PSI trend alerting — Issue-135
+# ---------------------------------------------------------------------------
+
+
+class EscalationLevel(str, Enum):
+    OK = "ok"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class TrendDirection(str, Enum):
+    RISING = "rising"
+    STABLE = "stable"
+    FALLING = "falling"
+
+    @staticmethod
+    def from_delta(delta: float) -> "TrendDirection":
+        if delta > 0.02:
+            return TrendDirection.RISING
+        if delta < -0.02:
+            return TrendDirection.FALLING
+        return TrendDirection.STABLE
+
+
+@dataclass
+class FeaturePSIRecord:
+    feature: str
+    psi: float
+    escalation_level: EscalationLevel
+    trend_direction: TrendDirection
+    psi_delta_24h: Optional[float]
+    threshold: float
+    computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class DriftReport:
+    features: list[FeaturePSIRecord] = field(default_factory=list)
+    computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    has_critical: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "computed_at": self.computed_at.isoformat(),
+            "has_critical": self.has_critical,
+            "features": [
+                {
+                    "feature": r.feature,
+                    "psi": r.psi,
+                    "escalation_level": r.escalation_level.value,
+                    "trend_direction": r.trend_direction.value,
+                    "psi_delta_24h": r.psi_delta_24h,
+                    "threshold": r.threshold,
+                    "computed_at": r.computed_at.isoformat(),
+                }
+                for r in self.features
+            ],
+        }
+
+
+_FEATURE_PSI_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS feature_psi_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature TEXT NOT NULL,
+    psi REAL NOT NULL,
+    escalation_level TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_psi_history_feature_time
+    ON feature_psi_history(feature, recorded_at);
+"""
+
+
+class PerFeaturePSIConfig:
+    """Per-feature PSI alert thresholds; defaults apply when no override is set."""
+
+    DEFAULT_WARNING = 0.10
+    DEFAULT_ERROR = 0.20
+    DEFAULT_CRITICAL = 0.25
+
+    def __init__(self, overrides: Optional[dict] = None) -> None:
+        self._overrides: dict[str, dict] = overrides or {}
+
+    def thresholds(self, feature: str) -> tuple[float, float, float]:
+        """Return (warning, error, critical) thresholds for ``feature``."""
+        cfg = self._overrides.get(feature, {})
+        return (
+            cfg.get("warning", self.DEFAULT_WARNING),
+            cfg.get("error", self.DEFAULT_ERROR),
+            cfg.get("critical", self.DEFAULT_CRITICAL),
+        )
+
+
+class DriftMonitor:
+    """Per-feature PSI tracking with three-tier escalation and webhook alerting."""
+
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        psi_config: Optional[PerFeaturePSIConfig] = None,
+    ) -> None:
+        from config.settings import settings as _s
+        self.db_path = db_path or _s.db_path
+        self.psi_config = psi_config or PerFeaturePSIConfig()
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(_FEATURE_PSI_HISTORY_DDL)
+        conn.commit()
+        conn.close()
+
+    def _escalate(self, feature: str, psi: float) -> EscalationLevel:
+        warning, error, critical = self.psi_config.thresholds(feature)
+        if psi >= critical:
+            logger.error("CRITICAL drift on feature '%s': PSI=%.4f", feature, psi)
+            return EscalationLevel.CRITICAL
+        if psi >= error:
+            logger.error("ERROR drift on feature '%s': PSI=%.4f", feature, psi)
+            return EscalationLevel.ERROR
+        if psi >= warning:
+            logger.warning("WARNING drift on feature '%s': PSI=%.4f", feature, psi)
+            return EscalationLevel.WARNING
+        return EscalationLevel.OK
+
+    def _record_psi(self, feature: str, psi: float, level: EscalationLevel) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO feature_psi_history (feature, psi, escalation_level, recorded_at) VALUES (?, ?, ?, ?)",
+            (feature, psi, level.value, now),
+        )
+        conn.commit()
+        conn.close()
+
+    def compute_trend(self, feature: str) -> tuple[Optional[float], TrendDirection]:
+        """Return (psi_delta_24h, trend_direction) from the stored PSI history."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT psi FROM feature_psi_history WHERE feature=? AND recorded_at >= ? ORDER BY recorded_at",
+            (feature, cutoff),
+        ).fetchall()
+        # Also get the value just before the 24h window for delta computation
+        prev_rows = conn.execute(
+            "SELECT psi FROM feature_psi_history WHERE feature=? AND recorded_at < ? ORDER BY recorded_at DESC LIMIT 1",
+            (feature, cutoff),
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return None, TrendDirection.STABLE
+        current_psi = rows[-1][0]
+        if prev_rows:
+            delta = current_psi - prev_rows[0][0]
+        elif len(rows) > 1:
+            delta = current_psi - rows[0][0]
+        else:
+            return None, TrendDirection.STABLE
+
+        return delta, TrendDirection.from_delta(delta)
+
+    def _trigger_webhook(self, feature: str, psi: float) -> None:
+        try:
+            from detection.webhook_queue import enqueue
+            from detection.webhook_registry import list_subscribers
+            subscribers = list_subscribers(active_only=True, db_path=self.db_path)
+            payload = {
+                "event": "feature_psi_critical",
+                "feature": feature,
+                "psi": psi,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            for sub in subscribers:
+                enqueue(sub.subscriber_id, payload, db_path=self.db_path)
+        except Exception:
+            logger.exception("Failed to enqueue PSI webhook for feature '%s'", feature)
+
+    def evaluate(
+        self,
+        psi_report: dict[str, float],
+    ) -> DriftReport:
+        """Evaluate a PSI report dict and return a :class:`DriftReport` with escalation metadata."""
+        report = DriftReport()
+        _, _, default_critical = self.psi_config.thresholds("")
+
+        for feature, psi in psi_report.items():
+            level = self._escalate(feature, psi)
+            self._record_psi(feature, psi, level)
+            psi_delta_24h, trend = self.compute_trend(feature)
+            _, _, critical_t = self.psi_config.thresholds(feature)
+
+            record = FeaturePSIRecord(
+                feature=feature,
+                psi=psi,
+                escalation_level=level,
+                trend_direction=trend,
+                psi_delta_24h=psi_delta_24h,
+                threshold=critical_t,
+            )
+            report.features.append(record)
+
+            if level == EscalationLevel.CRITICAL:
+                report.has_critical = True
+                self._trigger_webhook(feature, psi)
+
+        return report
+
+    def get_latest_report(self) -> dict:
+        """Return the most recent PSI value for each feature from history."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            """
+            SELECT feature, psi, escalation_level, recorded_at
+            FROM feature_psi_history
+            WHERE id IN (
+                SELECT MAX(id) FROM feature_psi_history GROUP BY feature
+            )
+            ORDER BY feature
+            """
+        ).fetchall()
+        conn.close()
+        return {
+            "features": [
+                {"feature": r[0], "psi": r[1], "escalation_level": r[2], "recorded_at": r[3]}
+                for r in rows
+            ],
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        }

@@ -810,6 +810,43 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+@app.command("red-team")
+def red_team(
+    model_dir: str = typer.Option("models", help="Directory containing trained model files"),
+    n_samples: int = typer.Option(100, help="Number of seed samples per attack campaign"),
+    evasion_threshold: float = typer.Option(0.05, help="Maximum allowed evasion rate (5%)"),
+    report_dir: str = typer.Option("./red_team_reports", help="Directory to write campaign reports"),
+    seed: int = typer.Option(42, help="Random seed for reproducibility"),
+) -> None:
+    """Run automated red-team attack campaigns and exit 1 if any campaign fails (CI gate)."""
+    from detection.model_inference import load_models
+    from detection.red_team.runner import RedTeamRunner
+
+    logger.info("Loading models from %s", model_dir)
+    models = load_models(model_dir=model_dir)
+
+    # Build generic feature constraints from model feature list
+    from detection.feature_engineering import FEATURE_NAMES
+    feature_constraints = {f: {"min": 0.0, "max": 1.0, "mutable": True} for f in FEATURE_NAMES}
+
+    runner = RedTeamRunner(
+        model=models,
+        feature_constraints=feature_constraints,
+        evasion_threshold=evasion_threshold,
+        report_dir=report_dir,
+        seed=seed,
+    )
+    summary = runner.run_all_campaigns(n_samples=n_samples)
+    path = runner.write_report(summary)
+    typer.echo(f"Campaign report written to {path}")
+    typer.echo(f"Overall result: {'PASSED' if summary.passed else 'FAILED'}")
+    for c in summary.campaigns:
+        typer.echo(f"  {c.attack_type.value}: evasion_rate={c.evasion_rate:.3f} {'OK' if c.passed else 'FAIL'}")
+
+    if not summary.passed:
+        raise typer.Exit(1)
+
+
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
