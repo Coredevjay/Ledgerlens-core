@@ -16,6 +16,7 @@ after a delay -- the breaker will allow exactly one probe connection once
 import logging
 import time
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import httpx
 import sseclient
@@ -37,6 +38,9 @@ horizon_circuit = CircuitBreaker(
     failure_threshold=HORIZON_FAILURE_THRESHOLD,
     recovery_timeout=HORIZON_RECOVERY_TIMEOUT_SECONDS,
 )
+
+if TYPE_CHECKING:
+    from detection.streaming_features import FeatureVector, StreamingFeatureEngine
 
 
 def _parse_trade(record: dict) -> Trade:
