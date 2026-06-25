@@ -12,6 +12,15 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 ## Unreleased
 
 ### Added
+- **Bayesian cross-chain linking**: `CrossChainLinker.score_hypothesis()` assigns probabilistic confidence scores (0–1) to Stellar↔EVM wallet link hypotheses using timing similarity, amount matching, direction consistency, and address-pattern features. Links below confidence=0.7 are rejected.
+- `WalletLinkHypothesis` dataclass and `LinkStatus` enum (`rejected`, `probable`, `confirmed`).
+- SQLite `cross_chain_links` table for persisting accepted hypotheses with upsert support.
+- `GET /cross-chain/links/{stellar_wallet}` endpoint returning accepted link hypotheses sorted by confidence.
+- `GET /cross-chain/links/{stellar_wallet}/explain` endpoint (admin-key gated) returning evidence feature breakdown.
+- `cross_chain_link_confidence` feature added to the cross-chain feature vector in `feature_engineering.py`.
+- `CROSS_CHAIN_TIMING_SIGMA_SECONDS`, `CROSS_CHAIN_AMOUNT_TOLERANCE`, `CROSS_CHAIN_MIN_CONFIDENCE`, `CROSS_CHAIN_CONFIRMED_CONFIDENCE` configuration variables.
+
+### Added
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
 - **#147** API endpoints `POST /scores/{wallet}/commit` and `POST /scores/verify-threshold` for ZK threshold proofs.
 - **#150** Full governance proposal engine (`detection/governance.py`): `GovernanceEngine` with `submit_proposal`, `cast_vote`, `tally_proposal`, `close_proposal`, `execute_proposal`, `close_expired`; `SettingsReloader` with compile-time allowlist and atomic `.env` write.

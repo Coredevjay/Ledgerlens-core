@@ -634,6 +634,13 @@ The response returns a `subscriber_id` (UUID) used for management.
 | `DELETE` | `/webhooks/{subscriber_id}` | Deactivate a subscriber            |
 | `GET`    | `/webhooks/dead-letters`    | List permanently failed deliveries |
 
+### Cross-Chain Link Endpoints
+
+| Method | Path                                          | Description                                                |
+| ------ | --------------------------------------------- | ---------------------------------------------------------- |
+| `GET`  | `/cross-chain/links/{stellar_wallet}`         | Accepted Bayesian link hypotheses (sorted by confidence)   |
+| `GET`  | `/cross-chain/links/{stellar_wallet}/explain` | Evidence feature breakdown per hypothesis (admin-key only) |
+
 ### Payload Format
 
 Every webhook POST carries this JSON body:

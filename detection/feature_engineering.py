@@ -118,6 +118,7 @@ CROSS_CHAIN_FEATURE_NAMES = [
     "evm_counterparty_concentration",
     "bridge_volume_ratio",
     "cross_chain_time_lag_median_h",
+    "cross_chain_link_confidence",
 ]
 
 CAUSAL_FEATURE_NAMES = [
@@ -647,6 +648,17 @@ def sandwich_features(
     }
 
 
+def compute_cross_chain_link_confidence(wallet: str, linker: "CrossChainLinker") -> float:
+    """Returns max confidence across all accepted cross-chain links for this wallet.
+
+    Returns 0.0 if no accepted links exist.
+    """
+    links = linker.get_accepted_links(wallet)
+    if not links:
+        return 0.0
+    return max(h.confidence for h in links)
+
+
 def build_cross_chain_features(
     wallet: str,
     linker: "CrossChainLinker",  # noqa: F821
@@ -685,6 +697,8 @@ def build_cross_chain_features(
     else:
         hhi = 0.0
 
+    link_confidence = compute_cross_chain_link_confidence(wallet, linker)
+
     return {
         "has_evm_link": 1.0,
         "evm_round_trip_frequency": float(pattern.get("round_trip_frequency", 0.0)),
@@ -692,6 +706,7 @@ def build_cross_chain_features(
         "evm_counterparty_concentration": float(hhi),
         "bridge_volume_ratio": float(bridge_volume_ratio),
         "cross_chain_time_lag_median_h": 0.0,
+        "cross_chain_link_confidence": float(link_confidence),
     }
 
 
