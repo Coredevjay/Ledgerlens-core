@@ -156,7 +156,7 @@ def _train_ensemble_base(
     mlflow.log_param("adversarial_augment", adversarial_augment)
     mlflow.log_param("calibrate", calibrate)
     mlflow.log_param("adversarial_hardening", adversarial_hardening)
-    mlflow.log_param("smote_k_neighbors", smote.k_neighbors)
+    mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
 
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
@@ -519,7 +519,7 @@ if __name__ == "__main__":
 
 
 from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
-from detection.mlflow_tracker import (
+from detection.mlflow_tracker import (  # noqa: E402
     log_metrics,
     log_training_dataset_metadata,
     mlflow_run,
