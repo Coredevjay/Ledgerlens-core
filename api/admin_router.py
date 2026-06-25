@@ -12,10 +12,27 @@ from pydantic import BaseModel
 from api.auth import require_admin_key
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
+from detection.oracle_node import OracleNode
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
 _MODEL_NAMES = ["random_forest", "xgboost", "lightgbm"]
+
+_ORACLE_NODES = []
+
+def _get_oracle_nodes() -> list[OracleNode]:
+    global _ORACLE_NODES
+    if not _ORACLE_NODES:
+        for i in range(1, 6):
+            env_var = f"ORACLE_NODE_{i}_KEY"
+            if os.environ.get(env_var):
+                try:
+                    node = OracleNode(name=f"oracle-{i}", private_key_env_var=env_var)
+                    _ORACLE_NODES.append(node)
+                except Exception as e:
+                    pass
+    return _ORACLE_NODES
+
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +142,25 @@ def patch_config(body: ConfigPatch) -> dict:
     _runtime_cache["config"] = {}
 
     return {"updated": list(body.updates.keys())}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/oracle/status
+# ---------------------------------------------------------------------------
+
+
+@router.get("/oracle/status", include_in_schema=False)
+def oracle_status() -> list[dict]:
+    """Return the status of the oracle nodes in the quorum."""
+    nodes = _get_oracle_nodes()
+    return [
+        {
+            "name": node.name,
+            "public_key": node.public_key_hex,
+            "last_seen": node.last_seen,
+        }
+        for node in nodes
+    ]
 
 
 # ---------------------------------------------------------------------------

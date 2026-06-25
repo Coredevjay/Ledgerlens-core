@@ -9,7 +9,12 @@ Releases are automated via [release-please](https://github.com/google-github-act
 merging a release PR (created by the `release-please` GitHub Action) tags the
 commit, generates this file, and publishes a tagged Docker image to GHCR.
 
-## Unreleased
+## [Unreleased]
+
+### Added
+- Multi-signature Oracle Quorum for tamper-resistant on-chain risk score publication using a 3-of-5 ED25519 threshold.
+- `GET /admin/oracle/status` endpoint to monitor oracle node health and keys.
+- Rust `oracle_aggregator` Soroban contract for robust on-chain threshold verification.
 
 ### Added
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
