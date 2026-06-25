@@ -644,5 +644,49 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+# ---------------------------------------------------------------------------
+# Audit log commands
+# ---------------------------------------------------------------------------
+
+audit_app = typer.Typer(help="Immutable audit log commands")
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command("verify")
+def audit_verify(
+    db_path: str = typer.Option(
+        None, "--db-path", help="Path to the audit log database (default: ./audit_log.db)"
+    ),
+) -> None:
+    """Verify the full HMAC-SHA256 audit chain from genesis.
+
+    Walks every entry in the audit log, recomputes each entry_hash, and
+    checks that prev_hash of each entry matches the entry_hash of the
+    previous entry. Reports the first broken link if any tampering is
+    detected.
+    """
+    from storage.audit_log import verify_chain
+
+    results = verify_chain(db_path)
+
+    total = len(results)
+    errors = [r for r in results if r["error"] is not None]
+
+    if not errors:
+        typer.echo(f"✓ Audit chain intact: {total} entry/entries verified, no errors.")
+        raise typer.Exit(0)
+
+    # Report the first broken link
+    first_error = errors[0]
+    typer.echo(f"✗ Chain broken at entry #{first_error['id']}:")
+    typer.echo(f"  {first_error['error']}")
+    typer.echo(f"  Stored entry_hash: {first_error['entry_hash']}")
+    typer.echo(f"  Computed hash:     {first_error['computed_hash']}")
+    typer.echo(f"  prev_hash_ok:      {first_error['prev_hash_ok']}")
+    typer.echo(f"  hash_ok:           {first_error['hash_ok']}")
+    typer.echo(f"  ({len(errors)} broken link(s) total)")
+    raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
