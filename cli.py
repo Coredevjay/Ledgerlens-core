@@ -644,6 +644,31 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+@app.command("completion")
+def completion(
+    shell: str = typer.Option(
+        "bash",
+        "--shell",
+        help="Target shell: bash, zsh, or fish",
+        case_sensitive=False,
+    ),
+) -> None:
+    """Print shell completion script for the LedgerLens CLI.
+
+    Usage: eval "$(ledgerlens completion --shell zsh)"
+    """
+    import click
+    from click.shell_completion import ShellCompletion
+
+    if shell not in ("bash", "zsh", "fish"):
+        raise typer.BadParameter(f"Unsupported shell '{shell}'. Choose bash, zsh, or fish.")
+
+    cmd = typer.main.get_command(app)
+    ctx = click.Context(cmd)
+    comp = ShellCompletion(ctx, name=cmd.name, shell=shell)
+    click.echo(comp.source())
+
+
 @app.command("report")
 def generate_report(
     wallet: str = typer.Argument(..., help="Stellar wallet address (G...)"),
