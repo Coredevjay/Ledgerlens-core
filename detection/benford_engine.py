@@ -30,14 +30,14 @@ approximation breakdown at small N.
 
 from __future__ import annotations
 
-import functools
 import logging
 import math
 import os
+import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -382,6 +382,9 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
             "observed_distribution": observed,
             "sample_size": 0,
         }
+
+    counts = np.array([observed.get(d, 0.0) * n for d in DIGITS])
+    p_value, p_method = compute_chi_square_pvalue(counts, n)
 
     return {
         "chi_square": chi_square_statistic(observed, n),

@@ -582,7 +582,6 @@ def amm_features(
     `0.0` for that feature. `amm_tenure_ratio` and `amm_volume_concentration`
     come from the AMMEngine session tracker when available.
     """
-    from detection.amm_engine import AMMEngine as _AMMEngine
     zero = {name: 0.0 for name in AMM_FEATURE_NAMES}
     if trades.empty or "trade_type" not in trades.columns:
         return zero

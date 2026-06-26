@@ -30,7 +30,6 @@ Feedback collection loop architecture:
   4. Degradation triggers retraining and fires a webhook ``model_degradation`` event
 """
 
-import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field

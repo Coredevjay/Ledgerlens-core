@@ -145,12 +145,14 @@ def patch_config(body: RuntimeConfigPatch) -> dict:
 @router.get("/oracle/status", include_in_schema=False)
 def oracle_status() -> list[dict]:
     """Return the status of the oracle nodes in the quorum."""
-    nodes = _get_oracle_nodes()
+    from detection.oracle_node import OracleNode
+    from config.settings import settings as _settings
+    nodes = [OracleNode(name, key) for name, key in getattr(_settings, "oracle_nodes", {}).items()]
     return [
         {
             "name": node.name,
             "public_key": node.public_key_hex,
-            "last_seen": node.last_seen,
+            "last_seen": getattr(node, "last_seen", None),
         }
         for node in nodes
     ]
