@@ -3,11 +3,15 @@
 import glob
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from api.auth import require_admin_key
 from config.settings import settings, _runtime_cache
@@ -16,6 +20,9 @@ from detection.model_registry import get_current_version, list_model_versions
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
 _MODEL_NAMES = ["random_forest", "xgboost", "lightgbm"]
+
+# Rate limiter instance for the reset endpoint
+_limiter = Limiter(key_func=get_remote_address)
 
 
 # ---------------------------------------------------------------------------

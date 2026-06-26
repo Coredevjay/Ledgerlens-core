@@ -380,6 +380,27 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         ALTER TABLE bridge_transfers ADD COLUMN verified_at TIMESTAMP;
         """,
     ),
+    (
+        14,
+        "add soroban_dead_letters table for DLQ",
+        """
+        CREATE TABLE IF NOT EXISTS soroban_dead_letters (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet          TEXT NOT NULL,
+            asset_pair      TEXT NOT NULL,
+            score           INTEGER NOT NULL,
+            ledger_timestamp INTEGER NOT NULL,
+            error_message   TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending', 'replayed', 'failed')),
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            replayed_at     TIMESTAMP,
+            replay_tx_hash  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dlq_status ON soroban_dead_letters(status);
+        CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
+        """,
+    ),
 ]
 
 

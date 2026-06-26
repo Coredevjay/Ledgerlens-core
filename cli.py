@@ -624,6 +624,90 @@ def db_migrate(
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
 
 
+@app.command("dlq-replay")
+def dlq_replay(
+    limit: int = typer.Option(100, help="Max dead letters to replay per run"),
+    dry_run: bool = typer.Option(False, help="Print DLQ contents without submitting"),
+) -> None:
+    """Replay pending Soroban dead-letter submissions.
+
+    Processes oldest-first. Marks each as 'replayed' on success or 'failed'
+    on persistent failure. Never removes rows from the DLQ.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from config.settings import settings
+    from detection.soroban_publisher import (
+        SorobanPublisher,
+        SorobanSubmissionError,
+        SorobanCircuitOpenError,
+        get_dlq_entries,
+        init_dlq_schema,
+    )
+    from detection.risk_score import RiskScore
+
+    secret_key = os.environ.get("LEDGERLENS_SERVICE_SECRET_KEY", "")
+    if not secret_key and not dry_run:
+        typer.echo("ERROR: LEDGERLENS_SERVICE_SECRET_KEY is not set. Cannot replay.", err=True)
+        raise typer.Exit(1)
+
+    init_dlq_schema()
+    items, total = get_dlq_entries(status="pending", page=1, page_size=limit)
+
+    if not items:
+        typer.echo("No pending DLQ entries.")
+        return
+
+    if dry_run:
+        typer.echo(f"DRY RUN — {len(items)} pending item(s):")
+        for item in items:
+            typer.echo(f"  [{item['id']}] {item['wallet']}:{item['asset_pair']} score={item['score']} error={item['error_message']}")
+        return
+
+    publisher = SorobanPublisher(
+        contract_id=os.environ.get("LEDGERLENS_SCORE_CONTRACT_ID", ""),
+        secret_key=secret_key,
+        soroban_rpc_url=os.environ.get("SOROBAN_RPC_URL", "https://soroban-testnet.stellar.org"),
+        network_passphrase=os.environ.get("NETWORK_PASSPHRASE", "Test SDF Network ; September 2015"),
+    )
+
+    db_path = settings.db_path
+    replayed = 0
+    failed = 0
+
+    for item in items:
+        score_obj = RiskScore(
+            wallet=item["wallet"],
+            asset_pair=item["asset_pair"],
+            score=item["score"],
+            benford_flag=False,
+            ml_flag=False,
+            confidence=0,
+            timestamp=datetime.fromtimestamp(item["ledger_timestamp"], tz=timezone.utc),
+        )
+        tx_hash = None
+        status = "failed"
+        try:
+            tx_hash = publisher.submit_score(score_obj)
+            status = "replayed"
+            replayed += 1
+            logger.info("DLQ item %d replayed: tx=%s", item["id"], tx_hash)
+        except (SorobanSubmissionError, SorobanCircuitOpenError, Exception) as exc:
+            logger.warning("DLQ item %d replay failed: %s", item["id"], exc)
+            failed += 1
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE soroban_dead_letters SET status=?, replayed_at=?, replay_tx_hash=? WHERE id=?",
+                (status, now_iso, tx_hash, item["id"]),
+            )
+            conn.commit()
+
+    typer.echo(f"DLQ replay complete: {replayed} replayed, {failed} failed out of {len(items)} items.")
+
+
 @app.command("governance-close-expired")
 def governance_close_expired() -> None:
     """Close all active governance proposals whose voting period has expired.
