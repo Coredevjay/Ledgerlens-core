@@ -119,6 +119,11 @@ class Settings(BaseSettings):
     ledgerlens_model_signing_key: str = ""
     ledgerlens_webhook_encryption_key: str = ""
 
+    # ── ED25519 model signing ────────────────────────────────────────────────
+    # Base64-encoded 32-byte ED25519 public key for model artifact signing.
+    # Generate with: python cli.py generate-signing-key
+    model_signing_public_key: str = ""
+
     # ── Federated learning ────────────────────────────────────────────────────
     federated_min_participants: int = 3
     federated_dp_epsilon: float = 1.0

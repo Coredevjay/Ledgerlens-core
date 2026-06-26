@@ -949,6 +949,64 @@ def sign_models(
     typer.echo(f"Signed {len(signed)} file(s), skipped {len(skipped)} already-valid file(s).")
 
 
+@app.command("generate-signing-key")
+def generate_signing_key() -> None:
+    """Generate a new ED25519 keypair for model signing.
+
+    Prints public key (for settings.py) and private key (for environment).
+    ONLY run this during initial setup or key rotation.
+    """
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    priv_b64 = base64.b64encode(
+        priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    ).decode()
+    pub_b64 = base64.b64encode(
+        pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ).decode()
+    typer.echo(
+        f"Public key (embed in config/settings.py as MODEL_SIGNING_PUBLIC_KEY):\n{pub_b64}"
+    )
+    typer.echo(
+        f"\nPrivate key (set as MODEL_SIGNING_PRIVATE_KEY env variable):\n{priv_b64}"
+    )
+    typer.echo("\nWARNING: Store the private key securely. It cannot be recovered.")
+
+
+@app.command("verify-models")
+def verify_models(
+    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+) -> None:
+    """Verify all model artifacts in MODEL_DIR using ED25519 signatures. Exits non-zero if any fail."""
+    from config.settings import settings
+    from detection.model_signing import ModelIntegrityError, get_model_signer
+
+    target_dir = model_dir or settings.model_dir
+    signer = get_model_signer()
+    failures = []
+    for model_file in sorted(Path(target_dir).glob("*.joblib")):
+        try:
+            signer.verify(model_file)
+            typer.echo(f"OK: {model_file.name}")
+        except ModelIntegrityError as e:
+            typer.echo(f"FAIL: {e}", err=True)
+            failures.append(model_file.name)
+    if failures:
+        raise typer.Exit(code=1)
+    if not list(Path(target_dir).glob("*.joblib")):
+        typer.echo(f"No .joblib files found in {target_dir}")
+
+
 @app.command("webhook-worker")
 def webhook_worker(
     interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
