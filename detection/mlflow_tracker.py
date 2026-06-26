@@ -112,7 +112,7 @@ def mlflow_run(
         raise
     finally:
         elapsed = time.monotonic() - start_time
-        mlflow.log_metric("training_duration_seconds", round(elapsed, 2))
+        mlflow.log_metric("training_duration_seconds", elapsed)
         mlflow.end_run(status="FINISHED")
         logger.info("Finished MLflow run %s (%.2f s)", run_id, elapsed)
 

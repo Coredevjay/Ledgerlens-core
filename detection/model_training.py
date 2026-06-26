@@ -338,11 +338,18 @@ def _train_ensemble_base(
                 name=name,
                 registered_model_name=None,
                 skops_trusted_types=[
-                    "xgboost.core.Booster",
-                    "xgboost.sklearn.XGBClassifier",
+                    "builtins.dict",
+                    "builtins.list",
+                    "collections.OrderedDict",
+                    "lightgbm.basic.Booster",
                     "lightgbm.sklearn.LGBMClassifier",
+                    "numpy.int64",
+                    "numpy.float64",
                     "sklearn.calibration.CalibratedClassifierCV",
                     "sklearn.ensemble._forest.RandomForestClassifier",
+                    "sklearn.linear_model._logistic.LogisticRegression",
+                    "xgboost.core.Booster",
+                    "xgboost.sklearn.XGBClassifier",
                 ],
             )
 

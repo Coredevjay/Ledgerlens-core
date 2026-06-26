@@ -400,6 +400,27 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON analyst_feedback (submitted_at);
         """,
     ),
+    (
+        15,
+        "create hop_payment_cycles table for path payment cycle detection",
+        """
+        CREATE TABLE IF NOT EXISTS hop_payment_cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origin_wallet TEXT NOT NULL,
+            origin_asset TEXT NOT NULL,
+            hops TEXT NOT NULL,
+            recovery_ratio REAL NOT NULL,
+            cycle_duration_seconds REAL NOT NULL,
+            counterparty_overlap REAL NOT NULL DEFAULT 0.0,
+            cycle_score REAL NOT NULL,
+            detected_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_hop_payment_cycles_wallet
+            ON hop_payment_cycles (origin_wallet);
+        CREATE INDEX IF NOT EXISTS idx_hop_payment_cycles_score
+            ON hop_payment_cycles (cycle_score DESC);
+        """,
+    ),
 ]
 
 

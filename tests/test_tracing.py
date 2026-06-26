@@ -40,10 +40,15 @@ def in_memory_tracer():
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    # OTel SDK blocks override once a real provider is set; reset the global
+    # directly so each test gets its own isolated in-memory exporter.
+    import opentelemetry.trace as _trace_api
+    _trace_api._TRACER_PROVIDER = None
     trace.set_tracer_provider(provider)
     yield exporter
     exporter.clear()
-    # Reset to default no-op provider
+    # Reset back to proxy so the next test can set its own provider
+    _trace_api._TRACER_PROVIDER = None
     trace.set_tracer_provider(trace.ProxyTracerProvider())
 
 
