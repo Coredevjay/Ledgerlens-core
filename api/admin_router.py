@@ -178,3 +178,51 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# FL Privacy endpoint  (Issue #145)
+# ---------------------------------------------------------------------------
+
+import logging as _logging
+_logger = _logging.getLogger("ledgerlens.admin")
+
+
+class FLPrivacyStatus(BaseModel):
+    current_epsilon: float
+    target_epsilon: float
+    delta: float
+    noise_multiplier: float
+    clip_norm: float
+    budget_exhausted: bool
+    rounds_completed: int
+
+
+@router.get("/fl/privacy", response_model=FLPrivacyStatus, include_in_schema=False)
+def fl_privacy_status() -> FLPrivacyStatus:
+    """Return current FL differential privacy budget status (admin-key gated)."""
+    db_path = settings.db_path
+    try:
+        from detection.federated.privacy_utils import get_privacy_log
+        rows = get_privacy_log(db_path)
+    except Exception:
+        rows = []
+
+    target_epsilon = float(os.environ.get("FL_DP_TARGET_EPSILON", "1.0"))
+    delta = float(os.environ.get("FL_DP_DELTA", "1e-5"))
+    noise_multiplier = float(os.environ.get("FL_DP_NOISE_MULTIPLIER", "0.0")) or float(
+        getattr(settings, "federated_noise_multiplier", 0.0)
+    )
+    clip_norm = float(os.environ.get("FL_DP_CLIP_NORM", "1.0"))
+    current_epsilon = rows[-1]["epsilon"] if rows else 0.0
+    budget_exhausted = current_epsilon >= target_epsilon
+
+    return FLPrivacyStatus(
+        current_epsilon=current_epsilon,
+        target_epsilon=target_epsilon,
+        delta=delta,
+        noise_multiplier=noise_multiplier,
+        clip_norm=clip_norm,
+        budget_exhausted=budget_exhausted,
+        rounds_completed=len(rows),
+    )
