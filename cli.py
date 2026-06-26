@@ -304,11 +304,31 @@ def retrain_check(
 def score(
     no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
     use_async: bool = typer.Option(False, "--async", help="Use async pipeline for concurrent I/O and batched inference"),
+    bootstrap_threshold: int = typer.Option(
+        None,
+        "--bootstrap-threshold",
+        help="Override BENFORD_BOOTSTRAP_THRESHOLD: wallets with fewer transactions than this use Monte Carlo bootstrap p-values instead of asymptotic chi-square.",
+    ),
+    bootstrap_samples: int = typer.Option(
+        None,
+        "--bootstrap-samples",
+        help="Override BENFORD_BOOTSTRAP_SAMPLES: number of bootstrap replicates for small-sample p-value estimation.",
+    ),
 ) -> None:
     """Run the detection pipeline against live Horizon data and store the resulting scores."""
     import asyncio
 
     import run_pipeline
+
+    if bootstrap_threshold is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_THRESHOLD = bootstrap_threshold
+        logger.info("Bootstrap threshold overridden to %d", bootstrap_threshold)
+
+    if bootstrap_samples is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_SAMPLES = bootstrap_samples
+        logger.info("Bootstrap samples overridden to %d", bootstrap_samples)
 
     if use_async:
         scores = asyncio.run(run_pipeline.async_run())

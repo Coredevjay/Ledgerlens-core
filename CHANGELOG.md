@@ -19,8 +19,28 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 - **#150** Governance REST endpoints: `POST/GET /governance/proposals`, `GET /governance/proposals/{id}`, `POST /governance/proposals/{id}/vote`, `POST /governance/proposals/{id}/execute` (admin-key gated).
 - **#150** `cli.py governance-close-expired` command.
 - `docs/governance_protocol.md` updated to reflect full implemented lifecycle.
-
-### Added
+- **Monte Carlo bootstrap p-values for Benford chi-square** (`detection/benford_engine.py`):
+  wallets with fewer than `BENFORD_BOOTSTRAP_THRESHOLD` (default 100) transactions
+  in a window now use an empirical p-value derived from 10,000 multinomial samples
+  drawn from the theoretical Benford distribution, eliminating false positives caused
+  by asymptotic chi-square approximation failures in small-sample regimes common on
+  SDEX short time windows (1h, 4h).
+- `bootstrap_chi_square_pvalue` function with fully vectorised NumPy implementation
+  (single `rng.multinomial` call; < 500 ms for N = 50, n = 10,000).
+- `BENFORD_PROBS` numpy array constant (normalised Benford probabilities for digits 1–9).
+- `BENFORD_BOOTSTRAP_THRESHOLD` and `BENFORD_BOOTSTRAP_SAMPLES` module constants,
+  overridable via environment variables.
+- `compute_chi_square_pvalue(counts, N) -> (p_value, method)` function that dispatches
+  to bootstrap or asymptotic computation based on sample size.
+- LRU cache (`maxsize=512`) on `_cached_bootstrap_pvalue` to avoid recomputing p-values
+  for repeated wallet-window evaluations with the same digit counts.
+- `BenfordWindowFeatures` dataclass with `chi_square_pvalue_method` field so callers and
+  audit logs know whether a flagging decision used bootstrap or asymptotic estimates.
+- `chi_square_pvalue` and `pvalue_method` keys added to the dict returned by
+  `compute_benford_metrics` (backward-compatible; existing keys unchanged).
+- `--bootstrap-threshold` and `--bootstrap-samples` CLI flags on `ledgerlens score`.
+- `BENFORD_BOOTSTRAP_THRESHOLD` and `BENFORD_BOOTSTRAP_SAMPLES` documented in `.env.example`.
+- `docs/benford_analysis.md` with "Small-Sample P-Value Estimation" methodology section.
 - Synthetic SDEX trade generator (`ingestion/synthetic_data.py`) with
   labelled wash-trading rings for local training and testing.
 - Labelled training dataset builder (`detection/dataset.py`).

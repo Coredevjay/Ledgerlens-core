@@ -126,6 +126,8 @@ Benford's Law predicts that the leading digit of naturally occurring transaction
 | Metric                            | What it measures                                                                                      |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | **Chi-square statistic**          | Whether the overall digit distribution deviates significantly from Benford's expected distribution    |
+| **Chi-square p-value**            | Statistical significance of the chi-square deviation. Uses **Monte Carlo bootstrap** (10,000 multinomial samples) when N < 100 transactions, asymptotic chi-square(df=8) otherwise — see [docs/benford_analysis.md](docs/benford_analysis.md) |
+| **`chi_square_pvalue_method`**    | `"bootstrap"` or `"asymptotic"` — logged alongside every flagging decision for audit reproducibility |
 | **Z-score (per digit)**           | Whether any individual digit (1–9) appears with significantly higher or lower frequency than expected |
 | **Mean Absolute Deviation (MAD)** | Composite divergence measure; values above 0.015 indicate non-conformity                              |
 
