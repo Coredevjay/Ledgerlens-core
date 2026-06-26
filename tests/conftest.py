@@ -31,6 +31,7 @@ def patch_signing_key(monkeypatch):
 
 # Files that need the real stellar_sdk during test execution.
 _REAL_STELLAR_SDK_TEST_FILES = frozenset([
+    "test_bridge_integrity.py",
     "test_bridge_loader.py",
     "test_cross_chain_linker.py",
     "test_cross_chain_features.py",

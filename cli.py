@@ -33,6 +33,8 @@ except Exception:
     __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
+audit_app = typer.Typer(help="Audit log commands")
+app.add_typer(audit_app, name="audit")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
 
@@ -693,6 +695,22 @@ def sign_models(
         logger.info("Already valid, skipped: %s", path)
 
     typer.echo(f"Signed {len(signed)} file(s), skipped {len(skipped)} already-valid file(s).")
+
+
+@audit_app.command("verify")
+def audit_verify(
+    db_path: str = typer.Option(None, "--db-path", help="Path to audit log database"),
+) -> None:
+    """Verify the HMAC-SHA256 chain integrity of the audit log."""
+    from storage.audit_log import is_chain_intact, verify_chain
+
+    results = verify_chain(db_path=db_path or None)
+    broken = [r for r in results if r["error"] is not None]
+    if broken:
+        for r in broken:
+            typer.echo(f"Chain broken at entry {r['id']}: {r['error']}")
+        raise typer.Exit(code=1)
+    typer.echo("Audit log chain is intact.")
 
 
 @app.command("webhook-worker")

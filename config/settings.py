@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     mlflow_tracking_enabled: bool = False
 
     # ── Performance monitoring ────────────────────────────────────────────────
-    performance_min_feedback_samples: int = 100
+    performance_min_feedback_samples: int = 20
     performance_monitoring_window_days: int = 30
 
     # ── Bridge / cross-chain verification ────────────────────────────────────
@@ -113,7 +113,8 @@ class Settings(BaseSettings):
     bridge_verify_sample_rate: float = 1.0
 
     # ── Path payment loader ───────────────────────────────────────────────────
-    path_payment_loader_enabled: bool = False
+    path_payment_loader_enabled: bool = True
+    path_payment_fetch_effects: bool = True
 
     # ── Validators ────────────────────────────────────────────────────────────
 

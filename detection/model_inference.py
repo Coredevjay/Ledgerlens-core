@@ -119,11 +119,20 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
         logger.warning("ensemble_weights.json unreadable: %s — falling back to settings", exc)
         return None
 
+    allowed_keys = _REQUIRED_KEYS | {"updated_at"}
+    unknown_keys = set(data.keys()) - allowed_keys
+    if unknown_keys:
+        logger.warning(
+            "ensemble_weights.json has unknown keys %s — falling back to settings",
+            unknown_keys,
+        )
+        return None
+
     model_keys = {k: data[k] for k in _REQUIRED_KEYS if k in data}
     if set(model_keys) != _REQUIRED_KEYS:
         logger.warning(
-            "ensemble_weights.json has unexpected keys %s — falling back to settings",
-            set(data.keys()) - {"updated_at"},
+            "ensemble_weights.json missing required keys %s — falling back to settings",
+            _REQUIRED_KEYS - set(model_keys),
         )
         return None
 

@@ -16,7 +16,7 @@ after a delay -- the breaker will allow exactly one probe connection once
 import asyncio
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import TYPE_CHECKING, Optional
 
 import httpx

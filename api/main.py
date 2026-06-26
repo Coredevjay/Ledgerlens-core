@@ -919,7 +919,7 @@ class LegacyProposalCreate(BaseModel):
 
 
 @v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)])
-def create_proposal_endpoint(body: ProposalCreate):
+def create_proposal_endpoint(body: LegacyProposalCreate):
     try:
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
     except ValueError as exc:
@@ -933,7 +933,7 @@ class LegacyProposalVote(BaseModel):
 
 
 @v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)])
-def vote_proposal(proposal_id: str, body: ProposalVote):
+def vote_proposal(proposal_id: str, body: LegacyProposalVote):
     try:
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
