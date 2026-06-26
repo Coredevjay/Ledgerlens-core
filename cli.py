@@ -377,7 +377,7 @@ def eval_robustness(
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
     baseline_results = train_ensemble(df, adversarial_augment=False, calibrate=False)
-    baseline_models = {k: v["model"] for k, v in baseline_results.items()}
+    baseline_models = {k: v["model"] for k, v in baseline_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of baseline model…")
     robustness = evaluate_robustness(baseline_models, n_trials=n_trials, seed=seed)
@@ -385,7 +385,7 @@ def eval_robustness(
     # Train an adversarially-augmented model
     logger.info("Training adversarially-augmented model…")
     adv_results = train_ensemble(df, adversarial_augment=adversarial_augment, calibrate=False)
-    adv_models = {k: v["model"] for k, v in adv_results.items()}
+    adv_models = {k: v["model"] for k, v in adv_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of augmented model…")
     adv_robustness = evaluate_robustness(adv_models, n_trials=n_trials, seed=seed)
@@ -452,7 +452,7 @@ def robustness_eval(
 
         logger.info("No trained models found; training temporary ensemble for robustness evaluation")
         results = train_ensemble(df, adversarial_augment=False)
-        models = {k: v["model"] for k, v in results.items()}
+        models = {k: v["model"] for k, v in results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
     typer.echo(report.model_dump_json(indent=2))

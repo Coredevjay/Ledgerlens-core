@@ -342,25 +342,11 @@ def _train_ensemble_base(
             mlflow.log_metric(f"{name}_f1", f1)
             mlflow.log_metric(f"{name}_precision", prec)
             mlflow.log_metric(f"{name}_recall", rec)
-            mlflow.sklearn.log_model(
-                model,
-                artifact_path=name,
-                registered_model_name=None,
-                skops_trusted_types=[
-                    "builtins.dict",
-                    "builtins.list",
-                    "collections.OrderedDict",
-                    "lightgbm.basic.Booster",
-                    "lightgbm.sklearn.LGBMClassifier",
-                    "numpy.int64",
-                    "numpy.float64",
-                    "sklearn.calibration.CalibratedClassifierCV",
-                    "sklearn.ensemble._forest.RandomForestClassifier",
-                    "sklearn.linear_model._logistic.LogisticRegression",
-                    "xgboost.core.Booster",
-                    "xgboost.sklearn.XGBClassifier",
-                ],
-            )
+            import tempfile as _tf
+            with _tf.TemporaryDirectory() as _tmpdir:
+                _mpath = os.path.join(_tmpdir, "model.joblib")
+                joblib.dump(model, _mpath)
+                mlflow.log_artifact(_mpath, artifact_path=name)
 
         results[name] = {
             "model": model,
