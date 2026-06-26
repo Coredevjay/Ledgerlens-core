@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 5
     trade_history_lookback_days: int = 30
     cursor_path: str = "./horizon_cursor.txt"
+    # Keep this below Horizon's per-IP request limit divided by average request duration.
+    historical_loader_concurrency: int = 4
+    historical_chunk_hours: float = 6.0
+    historical_progress_path: str = "./data/historical_progress.json"
+    historical_max_lookback_days: int = 365
 
     # ── Feature Store ─────────────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
@@ -144,6 +149,7 @@ class Settings(BaseSettings):
                      "committee_quorum", "committee_vote_deadline_days",
                      "federated_min_participants", "cursor_flush_events",
                      "stream_checkpoint_interval", "streamer_queue_maxsize",
+                     "historical_loader_concurrency", "historical_max_lookback_days",
                      mode="before")
     @classmethod
     def must_be_positive(cls, v: object) -> object:
@@ -183,7 +189,7 @@ class Settings(BaseSettings):
             raise ValueError("must be >= 0")
         return v
 
-    @field_validator("cursor_flush_seconds", mode="before")
+    @field_validator("cursor_flush_seconds", "historical_chunk_hours", mode="before")
     @classmethod
     def positive_cursor_flush_seconds(cls, v: object) -> object:
         if float(v) <= 0:
@@ -266,17 +272,19 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def checkpoint_path_is_inside_data_directory(self) -> "Settings":
         data_root = Path(self.data_dir).expanduser().resolve()
-        checkpoint = Path(self.cursor_checkpoint_path).expanduser()
-        if not checkpoint.is_absolute():
-            checkpoint = (Path.cwd() / checkpoint).resolve()
-        else:
-            checkpoint = checkpoint.resolve()
-        try:
-            checkpoint.relative_to(data_root)
-        except ValueError as exc:
-            raise ValueError(
-                "CURSOR_CHECKPOINT_PATH must remain inside DATA_DIR"
-            ) from exc
+        for field_name, raw_path in (
+            ("CURSOR_CHECKPOINT_PATH", self.cursor_checkpoint_path),
+            ("HISTORICAL_PROGRESS_PATH", self.historical_progress_path),
+        ):
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = (Path.cwd() / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            try:
+                candidate.relative_to(data_root)
+            except ValueError as exc:
+                raise ValueError(f"{field_name} must remain inside DATA_DIR") from exc
         return self
 
     @model_validator(mode="after")

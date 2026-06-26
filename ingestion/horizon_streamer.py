@@ -83,6 +83,7 @@ def _parse_trade(record: dict) -> Trade:
     )
     return Trade(
         id=record["id"],
+        paging_token=str(record.get("paging_token") or record["id"]),
         ledger_close_time=record["ledger_close_time"],
         base_account=record.get("base_account") or "",
         counter_account=record.get("counter_account"),

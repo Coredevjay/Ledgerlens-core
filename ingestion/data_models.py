@@ -43,6 +43,7 @@ class Trade(BaseModel):
     """
 
     id: str
+    paging_token: str | None = None
     ledger_close_time: datetime
     base_account: str
     counter_account: str | None = None

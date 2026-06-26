@@ -412,6 +412,9 @@ docker compose up --build
 python cli.py generate-data   # write synthetic trades/labels to CSV
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
+python cli.py historical-load --start 2026-05-01T00:00:00Z --end 2026-05-31T00:00:00Z \
+  --concurrency 8 --chunk-hours 6 --resume
+                              # parallel, restart-safe Horizon trade backfill
 python cli.py stream          # stream trades from Horizon SSE and score incrementally
                               #   --checkpoint-interval N  persist state every N trades (default: 100)
                               #   --score-delta N          min score change to emit alert (default: 5)

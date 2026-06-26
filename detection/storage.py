@@ -25,7 +25,7 @@ import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from ingestion.data_models import BridgeTransfer, PathPayment
+from ingestion.data_models import BridgeTransfer, PathPayment, Trade
 
 logger = logging.getLogger("ledgerlens.storage")
 
@@ -529,6 +529,66 @@ def init_db(db_path: str | None = None) -> None:
     """Initialise or upgrade the database schema via the migration system."""
     with _connect(db_path) as conn:
         migrate_db(conn)
+
+
+class RiskScoreStore:
+    """SQLite store used by scoring and historical trade ingestion.
+
+    Historical trades are inserted in page-sized batches with
+    ``INSERT OR IGNORE`` so replayed pages and adjacent boundary duplicates
+    are harmless.
+    """
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path = db_path or settings.db_path
+        init_db(self.db_path)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 30000")
+
+    def upsert_trades(self, trades: list[Trade]) -> int:
+        """Insert validated trades, ignoring existing paging tokens."""
+        if not trades:
+            return 0
+        rows = [
+            (
+                trade.paging_token or trade.id,
+                trade.id,
+                trade.ledger_close_time.isoformat(),
+                trade.base_account,
+                trade.counter_account,
+                trade.base_asset.code,
+                trade.base_asset.issuer,
+                trade.counter_asset.code,
+                trade.counter_asset.issuer,
+                trade.base_amount,
+                trade.counter_amount,
+                trade.price,
+                int(trade.base_is_seller),
+                trade.trade_type.value,
+                trade.liquidity_pool_id,
+                trade.transaction_hash,
+                trade.path_payment_id,
+                trade.hop_index,
+            )
+            for trade in trades
+        ]
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO trades (
+                    paging_token, trade_id, ledger_close_time, base_account,
+                    counter_account, base_asset_code, base_asset_issuer,
+                    counter_asset_code, counter_asset_issuer, base_amount,
+                    counter_amount, price, base_is_seller, trade_type,
+                    liquidity_pool_id, transaction_hash, path_payment_id, hop_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return conn.total_changes - before
 
 
 def save_scores(scores: list[RiskScore], db_path: str | None = None) -> None:

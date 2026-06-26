@@ -319,6 +319,70 @@ def score(
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
 
 
+@app.command("historical-load")
+def historical_load(
+    start: str = typer.Option(..., "--start", help="Inclusive ISO-8601 start time"),
+    end: str = typer.Option(..., "--end", help="Exclusive ISO-8601 end time"),
+    concurrency: int | None = typer.Option(
+        None, "--concurrency", min=1, help="Maximum concurrent Horizon chunks"
+    ),
+    chunk_hours: float | None = typer.Option(
+        None, "--chunk-hours", min=0.01, help="Hours per independent chunk"
+    ),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Skip chunks already marked complete"
+    ),
+    asset_pair: str | None = typer.Option(
+        None, "--asset-pair", help="Optional BASE/COUNTER asset pair"
+    ),
+) -> None:
+    """Backfill historical Horizon trades with bounded parallel workers."""
+    import asyncio
+    from datetime import datetime
+
+    from config.settings import settings as cfg
+    from detection.storage import RiskScoreStore
+    from ingestion.historical_loader import ParallelHistoricalLoader
+    from ingestion.http_client import RetryingHorizonClient
+
+    def parse_datetime(value: str, option: str) -> datetime:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise typer.BadParameter("must be an ISO-8601 datetime", param_hint=option) from exc
+
+    start_time = parse_datetime(start, "--start")
+    end_time = parse_datetime(end, "--end")
+
+    async def run() -> None:
+        worker_count = concurrency or cfg.historical_loader_concurrency
+        hours = chunk_hours or cfg.historical_chunk_hours
+        async with RetryingHorizonClient(
+            cfg.horizon_url,
+            max_concurrency=worker_count,
+        ) as client:
+            loader = ParallelHistoricalLoader(
+                client=client,
+                storage=RiskScoreStore(cfg.db_path),
+                concurrency=worker_count,
+                chunk_hours=hours,
+                progress_path=Path(cfg.historical_progress_path),
+            )
+            result = await loader.load(
+                start_time,
+                end_time,
+                asset_pair=asset_pair,
+                resume=resume,
+            )
+            typer.echo(
+                f"completed={result.completed_chunks} failed={result.failed_chunks} "
+                f"skipped={result.skipped_chunks} records={result.total_records} "
+                f"records_per_second={result.records_per_second:.1f}"
+            )
+
+    asyncio.run(run())
+
+
 @app.command("eval-robustness")
 def eval_robustness(
     n_trials: int = typer.Option(5, help="Adversarial dataset repetitions per strategy (more = slower but stabler)"),

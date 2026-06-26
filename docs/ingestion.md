@@ -61,3 +61,24 @@ Changing a queue's strategy after construction is intentionally unsupported.
 
 Dropped-event warnings are rate-limited to every 100 events. Operators should
 alert on non-zero drop counts and sustained high-water-mark hits.
+
+## Parallel historical loading
+
+`python cli.py historical-load` divides an inclusive-start, exclusive-end time
+range into independent chunks and fetches them concurrently through the shared
+retrying Horizon client. Each response is validated into the canonical
+Pydantic `Trade` model before a page-sized SQLite batch is written with
+`INSERT OR IGNORE`.
+
+Chunk completion is stored atomically in `HISTORICAL_PROGRESS_PATH` (default
+`./data/historical_progress.json`). With `--resume`, completed chunks make no
+HTTP requests; failed and interrupted chunks are retried. The progress path
+must remain inside `DATA_DIR`.
+
+Defaults are controlled by `HISTORICAL_LOADER_CONCURRENCY=4`,
+`HISTORICAL_CHUNK_HOURS=6.0`, and
+`HISTORICAL_MAX_LOOKBACK_DAYS=365`. Larger concurrency improves throughput
+until Horizon's per-IP rate limit is reached. Start conservatively, monitor
+429 responses, and reduce concurrency when retries dominate. Smaller chunks
+improve load balancing and restart granularity but increase progress metadata
+and initial request overhead.
