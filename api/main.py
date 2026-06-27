@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
+from api.allowlist_router import router as allowlist_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.namespace import list_namespaces
@@ -179,7 +180,7 @@ from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
 app.include_router(admin_router)
-
+app.include_router(allowlist_router)
 
 app.include_router(batch_router)
 
@@ -477,8 +478,26 @@ def wallet_scores(wallet: str) -> dict:
     database), the response includes a ``"cross_chain_links"`` field listing
     the linked EVM wallets and the chain they were last seen on.  EVM RPC
     endpoint URLs are never exposed in this response.
+
+    When the wallet is on the allowlist the score is forced to 0 and
+    ``override: "allowlisted"`` is included.  When on the denylist the
+    score is forced to 100 and ``override: "denylisted"`` is included.
     """
+    from detection.wallet_override_store import get_active_override
+
     validate_stellar_address(wallet)
+
+    override_entry = get_active_override(wallet)
+    if override_entry:
+        list_type = override_entry["list_type"]
+        forced_score = 0 if list_type == "allowlist" else 100
+        override_label = "allowlisted" if list_type == "allowlist" else "denylisted"
+        return {
+            "scores": [{"wallet": wallet, "score": forced_score}],
+            "override": override_label,
+            "cross_chain_links": [],
+        }
+
     scores = get_latest_scores(wallet=wallet)
     if not scores:
         raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
