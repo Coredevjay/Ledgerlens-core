@@ -217,6 +217,11 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # neighbours; a wallet lowers it by trading with lower-risk counterparties.
     _decreasable("gnn_wash_ring_probability"),
     _decreasable("gnn_neighbor_avg_score"),
+
+    # --- Path-payment features (1) ------------------------------------------
+    # path_payment_frequency: higher fraction of path-payment trades correlates
+    # with wash-trading; a wallet reduces suspicion by decreasing it.
+    _decreasable("path_payment_frequency"),
 ]
 
 _missing = set(FEATURE_NAMES) - {c.feature_name for c in FEATURE_CONSTRAINTS}
