@@ -861,6 +861,8 @@ def wallet_scores(wallet: str) -> dict:
     If the wallet is allowlisted, all scores are overridden to 0.
     If denylisted, all scores are overridden to 100.
     """
+    from detection.wallet_override_store import get_active_override
+
     validate_stellar_address(wallet)
 
     # Check for manual override before hitting the score store
