@@ -35,9 +35,6 @@ except Exception:
     __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
-audit_app = typer.Typer(help="Audit log commands")
-app.add_typer(audit_app, name="audit")
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
 
 
@@ -471,8 +468,13 @@ def retrain_check(
     logger.info("Wrote drift report to %s", report_path)
 
 
-@app.command("score")
+score_app = typer.Typer(help="Scoring commands")
+app.add_typer(score_app, name="score")
+
+
+@score_app.callback(invoke_without_command=True)
 def score(
+    ctx: typer.Context,
     no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
     use_async: bool = typer.Option(False, "--async", help="Use async pipeline for concurrent I/O and batched inference"),
     bootstrap_threshold: int = typer.Option(
@@ -487,6 +489,8 @@ def score(
     ),
 ) -> None:
     """Run the detection pipeline against live Horizon data and store the resulting scores."""
+    if ctx.invoked_subcommand is not None:
+        return
     import asyncio
 
     import run_pipeline
@@ -507,6 +511,154 @@ def score(
         scores = run_pipeline.run(no_submit=no_submit)
     for s in scores:
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
+
+
+_STELLAR_RE = __import__("re").compile(r"^G[A-Z2-7]{55}$")
+
+
+@score_app.command("bulk")
+def score_bulk(
+    input: Path = typer.Option(..., "--input", "-i", help="Input CSV: one Stellar wallet per row (wallet column required)"),
+    output: Path = typer.Option(..., "--output", "-o", help="Output CSV for scored results"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=16, help="Parallel workers (max 16)"),
+    min_score: int = typer.Option(0, "--min-score", help="Exclude results with score below this value"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate input file and report wallet count without scoring"),
+) -> None:
+    """Score a CSV list of Stellar wallets against the local detection pipeline.
+
+    Input CSV must have a 'wallet' column (one address per row). An optional
+    'label' column is passed through to the output unchanged.  Malformed
+    addresses are skipped with a warning written to stderr.
+
+    Output columns: wallet, score, confidence_lower, confidence_upper,
+    top_features, scored_at, label (if present).
+    """
+    import csv
+    import json
+    import sys
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime, timezone
+
+    import pandas as pd
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
+
+    from config.settings import settings as cfg
+    from detection.model_inference import load_models, score_with_uncertainty
+    from detection.storage import get_feature_vector, init_db
+
+    # ── 1. Read input CSV ────────────────────────────────────────────────
+    if not input.exists():
+        typer.echo(f"Error: input file not found: {input}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        df_in = pd.read_csv(input)
+    except Exception as exc:
+        typer.echo(f"Error reading CSV: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if "wallet" not in df_in.columns:
+        typer.echo("Error: input CSV must have a 'wallet' column", err=True)
+        raise typer.Exit(1)
+
+    has_label = "label" in df_in.columns
+    raw_rows = df_in.to_dict("records")
+
+    # ── 2. Validate addresses ────────────────────────────────────────────
+    valid: list[dict] = []
+    skipped = 0
+    for row in raw_rows:
+        wallet = str(row.get("wallet", "")).strip()
+        if not _STELLAR_RE.match(wallet):
+            typer.echo(f"WARNING: skipping malformed address: {wallet!r}", err=True)
+            skipped += 1
+        else:
+            valid.append(row)
+
+    typer.echo(f"Loaded {len(valid)} valid wallet(s) ({skipped} skipped).")
+
+    if dry_run:
+        typer.echo("[dry-run] Input validation complete — no scoring performed.")
+        return
+
+    if not valid:
+        typer.echo("No valid wallets to score.", err=True)
+        raise typer.Exit(1)
+
+    # ── 3. Load models once ──────────────────────────────────────────────
+    try:
+        models = load_models(cfg.model_dir)
+    except Exception as exc:
+        typer.echo(f"Error loading models: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # ── 4. Initialise DB ─────────────────────────────────────────────────
+    init_db(cfg.db_path)
+
+    # ── 5. Scoring worker ────────────────────────────────────────────────
+    asset_pair = "XLM/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    scored_at = datetime.now(timezone.utc).isoformat()
+
+    def _score_wallet(row: dict) -> dict | None:
+        wallet = str(row["wallet"]).strip()
+        fv = get_feature_vector(wallet, asset_pair, db_path=cfg.db_path)
+        if fv is None:
+            from detection.feature_engineering import FEATURE_NAMES
+            fv = {name: 0.0 for name in FEATURE_NAMES}
+        try:
+            result = score_with_uncertainty(models, fv)
+        except Exception as exc:
+            logger.warning("Scoring failed for %s: %s", wallet, exc)
+            return None
+        score_val = int(round(result["score"]))
+        out: dict = {
+            "wallet": wallet,
+            "score": score_val,
+            "confidence_lower": round(result.get("score_lower", 0.0), 2),
+            "confidence_upper": round(result.get("score_upper", 100.0), 2),
+            "top_features": json.dumps(result.get("shap_values", [])),
+            "scored_at": scored_at,
+        }
+        if has_label:
+            out["label"] = row.get("label", "")
+        return out
+
+    # ── 6. Run with progress bar ─────────────────────────────────────────
+    results: list[dict] = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        refresh_per_second=2,
+    ) as progress:
+        task = progress.add_task("Scoring wallets", total=len(valid))
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_score_wallet, row): row for row in valid}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is not None and result["score"] >= min_score:
+                    results.append(result)
+                progress.advance(task)
+
+    # ── 7. Write output CSV ──────────────────────────────────────────────
+    if not results:
+        typer.echo("No results to write (all wallets filtered or failed).")
+        return
+
+    fieldnames = ["wallet", "score", "confidence_lower", "confidence_upper", "top_features", "scored_at"]
+    if has_label:
+        fieldnames.append("label")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    typer.echo(f"Scored {len(results)} wallet(s) → {output}")
 
 
 @app.command("historical-load")
@@ -1355,7 +1507,7 @@ def red_team(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
-db_app = typer.Typer(help="Database maintenance commands")
+db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
 app.add_typer(db_app, name="db")
 
 
@@ -1416,10 +1568,6 @@ def config_validate() -> None:
         raw = getattr(s, name)
         value = "***" if name in _SECRETS and raw else raw
         typer.echo(f"  {name}={value}")
-
-
-db_app = typer.Typer(help="Database migration commands (Alembic-backed)")
-app.add_typer(db_app, name="db")
 
 
 @db_app.command("migrate")

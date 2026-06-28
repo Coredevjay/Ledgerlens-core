@@ -62,6 +62,14 @@ dp-accounting>=0.4.3
 # imported lazily inside function bodies so version bumps are safe at import time.
 dowhy>=0.12
 
+# Observability
+structlog>=24.1.0
+prometheus-client>=0.20.0
+opentelemetry-sdk>=1.24.0
+opentelemetry-api>=1.24.0
+opentelemetry-exporter-otlp-proto-grpc>=1.24.0
+opentelemetry-instrumentation-fastapi>=0.45b0
+
 # Testing
 pytest>=8.0.0
 pytest-cov>=5.0.0
