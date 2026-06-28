@@ -1,119 +1,183 @@
-"""Alert deduplication engine — Issue #177.
+"""Alert deduplication engine (Issue #177).
 
-Tracks per-wallet alert state in SQLite so that a wallet with a persistently
-high risk score generates exactly one ``alert.opened`` event rather than one
-per scoring cycle.  Three event types are emitted:
-
-- ``alert.opened``    — wallet score first crosses the threshold from below.
-- ``alert.escalated`` — score increases by > 10 points while alert is active.
-- ``alert.resolved``  — score has been below the threshold for
-                        ``RESOLVE_STREAK`` consecutive scoring cycles
-                        (hysteresis guard).
-
-State survives server restarts: all state is written to the ``alert_states``
-SQLite table after every call to :meth:`AlertDeduplicator.process`.
+Tracks per-wallet alert state in SQLite and emits events only on transitions:
+- alert.opened  — score first crosses threshold
+- alert.escalated — score increases by > 10 points while alert is active
+- alert.resolved  — score below threshold for 3 consecutive cycles (hysteresis)
 """
 
 import logging
+import sqlite3
 from datetime import datetime, timezone
+from typing import Optional
 
-from detection.storage import get_alert_state, save_alert_state
+from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.alert_engine")
 
-# Number of consecutive below-threshold cycles required before resolving.
-RESOLVE_STREAK = 3
-# Minimum score increase (while active) to emit alert.escalated.
-ESCALATION_DELTA = 10
+_ESCALATION_DELTA = 10
+_RESOLUTION_CONSECUTIVE = 3
+
+
+def _ensure_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS alert_states (
+            wallet TEXT PRIMARY KEY,
+            alert_active INTEGER NOT NULL DEFAULT 0,
+            last_score REAL NOT NULL DEFAULT 0,
+            below_threshold_streak INTEGER NOT NULL DEFAULT 0,
+            opened_at TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS alert_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            score REAL NOT NULL,
+            previous_score REAL,
+            emitted_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alert_events_wallet ON alert_events (wallet);
+        """
+    )
+
+
+def _emit_event(
+    conn: sqlite3.Connection,
+    wallet: str,
+    event_type: str,
+    score: float,
+    previous_score: Optional[float],
+) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO alert_events (wallet, event_type, score, previous_score, emitted_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (wallet, event_type, score, previous_score, now),
+    )
+    event = {
+        "event_type": event_type,
+        "wallet": wallet,
+        "score": score,
+        "previous_score": previous_score,
+        "emitted_at": now,
+    }
+    logger.info("Alert event: %s wallet=%s score=%.1f", event_type, wallet, score)
+    return event
 
 
 class AlertDeduplicator:
-    """Stateful deduplicator that suppresses redundant high-risk notifications.
+    """Deduplicate alerts by tracking per-wallet active state across scoring cycles."""
 
-    Args:
-        threshold: Risk score at or above which an alert is considered active.
-        db_path:   Optional SQLite path; uses ``settings.db_path`` when omitted.
-    """
+    def __init__(self, db_path: Optional[str] = None, threshold: Optional[int] = None):
+        self._db_path = db_path or settings.db_path
+        self._threshold = threshold if threshold is not None else settings.risk_score_threshold
 
-    def __init__(self, threshold: int = 70, db_path: str | None = None) -> None:
-        self.threshold = threshold
-        self.db_path = db_path
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    def process(self, wallet: str, score: float) -> list[dict]:
+        """Process a new score observation for wallet. Returns list of emitted events.
 
-    def process(self, wallet: str, score: int) -> str | None:
-        """Evaluate ``score`` for ``wallet`` and return an event name or None.
-
-        Returns one of:
-        - ``"alert.opened"``    — new alert created.
-        - ``"alert.escalated"`` — existing alert escalated.
-        - ``"alert.resolved"``  — alert closed after hysteresis window.
-        - ``None``              — no state transition (emit nothing).
-
-        Side-effect: persists updated state to SQLite.
+        Returns an empty list without updating alert state when an active
+        suppression rule exists for the wallet.
         """
-        state = get_alert_state(wallet, db_path=self.db_path) or self._new_state(wallet)
+        from detection.suppressions import is_suppressed
+        rule = is_suppressed(wallet, db_path=self._db_path)
+        if rule:
+            logger.info(
+                "Alert suppressed: wallet=%s rule_id=%d reason=%s",
+                wallet,
+                rule["id"],
+                rule["reason"],
+            )
+            return []
+
+        events: list[dict] = []
         now = datetime.now(timezone.utc).isoformat()
-        event: str | None = None
 
-        if score >= self.threshold:
-            if not state["alert_active"]:
-                # Transition: inactive → active
-                state["alert_active"] = True
-                state["opened_at"] = now
-                state["resolved_at"] = None
-                state["below_threshold_streak"] = 0
-                event = "alert.opened"
-                logger.info("alert.opened wallet=%s score=%d", wallet, score)
+        with self._connect() as conn:
+            _ensure_tables(conn)
+
+            row = conn.execute(
+                "SELECT * FROM alert_states WHERE wallet = ?", (wallet,)
+            ).fetchone()
+
+            if row is None:
+                alert_active = False
+                last_score = 0.0
+                below_streak = 0
+                opened_at = None
             else:
-                # Already active — check for escalation
-                delta = score - state["last_score"]
-                if delta > ESCALATION_DELTA:
-                    state["last_escalated_at"] = now
-                    event = "alert.escalated"
-                    logger.info(
-                        "alert.escalated wallet=%s score=%d delta=%d",
-                        wallet,
-                        score,
-                        delta,
-                    )
-                # Reset streak since we're above threshold
-                state["below_threshold_streak"] = 0
-        else:
-            if state["alert_active"]:
-                state["below_threshold_streak"] = state["below_threshold_streak"] + 1
-                if state["below_threshold_streak"] >= RESOLVE_STREAK:
-                    state["alert_active"] = False
-                    state["resolved_at"] = now
-                    state["below_threshold_streak"] = 0
-                    event = "alert.resolved"
-                    logger.info("alert.resolved wallet=%s score=%d", wallet, score)
-            # If not active, nothing changes
+                alert_active = bool(row["alert_active"])
+                last_score = float(row["last_score"])
+                below_streak = int(row["below_threshold_streak"])
+                opened_at = row["opened_at"]
 
-        state["last_score"] = score
-        state["updated_at"] = now
-        save_alert_state(state, db_path=self.db_path)
-        return event
+            above = score >= self._threshold
 
-    def get_state(self, wallet: str) -> dict | None:
-        """Return the current deduplication state for ``wallet``, or None."""
-        return get_alert_state(wallet, db_path=self.db_path)
+            if not alert_active:
+                if above:
+                    # Transition: closed → opened
+                    opened_at = now
+                    alert_active = True
+                    below_streak = 0
+                    events.append(_emit_event(conn, wallet, "alert.opened", score, None))
+                else:
+                    below_streak = 0
+            else:
+                if above:
+                    below_streak = 0
+                    if score > last_score + _ESCALATION_DELTA:
+                        events.append(
+                            _emit_event(conn, wallet, "alert.escalated", score, last_score)
+                        )
+                else:
+                    below_streak += 1
+                    if below_streak >= _RESOLUTION_CONSECUTIVE:
+                        alert_active = False
+                        below_streak = 0
+                        opened_at = None
+                        events.append(
+                            _emit_event(conn, wallet, "alert.resolved", score, last_score)
+                        )
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
+            conn.execute(
+                """
+                INSERT INTO alert_states
+                    (wallet, alert_active, last_score, below_threshold_streak, opened_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wallet) DO UPDATE SET
+                    alert_active = excluded.alert_active,
+                    last_score = excluded.last_score,
+                    below_threshold_streak = excluded.below_threshold_streak,
+                    opened_at = excluded.opened_at,
+                    updated_at = excluded.updated_at
+                """,
+                (wallet, int(alert_active), score, below_streak, opened_at, now),
+            )
 
-    @staticmethod
-    def _new_state(wallet: str) -> dict:
-        return {
-            "wallet": wallet,
-            "alert_active": False,
-            "last_score": 0,
-            "below_threshold_streak": 0,
-            "opened_at": None,
-            "last_escalated_at": None,
-            "resolved_at": None,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
+        return events
+
+    def get_state(self, wallet: str) -> Optional[dict]:
+        with self._connect() as conn:
+            _ensure_tables(conn)
+            row = conn.execute(
+                "SELECT * FROM alert_states WHERE wallet = ?", (wallet,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_events(self, wallet: str, limit: int = 100) -> list[dict]:
+        with self._connect() as conn:
+            _ensure_tables(conn)
+            rows = conn.execute(
+                "SELECT * FROM alert_events WHERE wallet = ? ORDER BY emitted_at DESC LIMIT ?",
+                (wallet, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]

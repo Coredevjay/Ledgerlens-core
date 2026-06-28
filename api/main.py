@@ -39,8 +39,7 @@ from api.admin_router import router as admin_router
 from api.analyst import router as analyst_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
-from api.allowlist_router import router as allowlist_router
-from api.api_key_router import router as api_key_router
+from api.cross_chain_router import router as cross_chain_router
 from api.namespace import list_namespaces
 from config.settings import settings
 from detection.tracing import (
@@ -70,6 +69,7 @@ from detection.storage import (
     get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
+from detection.feedback_store import AnalystFeedbackStore
 from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
@@ -132,11 +132,41 @@ def validate_stellar_address(wallet: str) -> None:
 
 _models: dict = {}
 
+# ---------------------------------------------------------------------------
+# Graceful shutdown state
+# ---------------------------------------------------------------------------
+_shutting_down: bool = False
+SHUTDOWN_TIMEOUT = int(os.environ.get("SHUTDOWN_TIMEOUT", "30"))
+_inflight_requests: int = 0
+_inflight_lock = __import__("threading").Lock()
+
+
+async def _nightly_retention_task() -> None:
+    """Async background task: run the data retention job once per night at midnight UTC."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    while True:
+        now = datetime.now(timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        sleep_seconds = (next_midnight - now).total_seconds()
+        await asyncio.sleep(sleep_seconds)
+        try:
+            from storage.retention import RetentionEngine
+            engine = RetentionEngine(db_path=settings.db_path)
+            report = engine.run(dry_run=False)
+            for table, info in report.items():
+                archived = info.get("rows_archived", 0)
+                if archived:
+                    logger.info("[retention] %s: archived %d row(s) to %s", table, archived, info.get("archive_path"))
+        except Exception as exc:
+            logger.error("[retention] Nightly job failed: %s", exc)
+
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    """Load trained models at startup; close WebSocket connections at shutdown."""
-    global _models
+    """Load trained models at startup; drain requests and clean up on shutdown."""
+    global _models, _shutting_down
     configure_tracing()
     try:
         from detection.model_inference import load_models
@@ -145,26 +175,87 @@ async def _lifespan(application: FastAPI):
     except (FileNotFoundError, RuntimeError) as e:
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
+
+    import asyncio as _asyncio
+    _retention_task = _asyncio.create_task(_nightly_retention_task())
     yield
+
+    # ── Shutdown sequence ────────────────────────────────────────────────
+    import asyncio
+
+    _retention_task.cancel()
+
+    _shutting_down = True
+    logger.info("[shutdown] Stopping new requests (returning 503)")
+
+    # Wait for in-flight requests to drain
+    deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+    while time.monotonic() < deadline:
+        with _inflight_lock:
+            count = _inflight_requests
+        if count == 0:
+            logger.info("[shutdown] All in-flight requests drained")
+            break
+        await asyncio.sleep(0.25)
+    else:
+        with _inflight_lock:
+            count = _inflight_requests
+        if count > 0:
+            logger.warning("[shutdown] Timed out with %d in-flight requests", count)
+
+    # Close WebSocket connections
     from api.ws_router import manager as _ws_manager
     await _ws_manager.close_all()
+    logger.info("[shutdown] WebSocket connections closed")
 
+    # SQLite WAL checkpoint
+    try:
+        from detection.storage import _connect
+        with _connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.info("[shutdown] SQLite WAL checkpoint complete")
+    except Exception as exc:
+        logger.warning("[shutdown] SQLite WAL checkpoint failed: %s", exc)
+
+    # Flush Redis connection if available
+    try:
+        from detection.feature_store import FeatureStore
+        fs = FeatureStore.__dict__.get("_instance")
+        if fs and hasattr(fs, "_redis") and fs._redis:
+            fs._redis.close()
+            logger.info("[shutdown] Redis connection closed")
+    except Exception as exc:
+        logger.warning("[shutdown] Redis cleanup failed: %s", exc)
+
+    logger.info("[shutdown] Shutdown sequence complete")
+
+
+_OPENAPI_TAGS = [
+    {"name": "Scores", "description": "Wallet risk score retrieval and explanation endpoints."},
+    {"name": "Alerts", "description": "Manipulation alert listing and deduplication state."},
+    {"name": "Webhooks", "description": "Webhook subscriber management."},
+    {"name": "Feedback", "description": "Ground-truth feedback ingestion for model improvement."},
+    {"name": "AMM", "description": "Automated Market Maker pool risk metrics."},
+    {"name": "Disputes", "description": "Score dispute submission and committee voting."},
+    {"name": "Governance", "description": "On-chain parameter governance proposals."},
+    {"name": "Admin", "description": "Admin-only model lifecycle, config, and observability endpoints."},
+    {"name": "Allowlist / Denylist", "description": "Wallet allowlist and denylist management with audit trail."},
+    {"name": "export", "description": "CSV / Parquet bulk export of risk score data."},
+    {"name": "batch", "description": "Async batch wallet scoring jobs."},
+]
 
 app = FastAPI(
-    title="LedgerLens",
+    title="LedgerLens API",
     description=(
-        "LedgerLens REST API — real-time risk scoring, manipulation detection, "
-        "and governance for the Stellar DEX.  Serves RiskScore records produced "
-        "by the detection pipeline and exposes admin/compliance tools for "
-        "exchange operators.\n\n"
-        "## Authentication\n"
-        "- **Admin endpoints** require ``X-LedgerLens-Admin-Key`` header.\n"
-        "- **Compliance endpoints** require ``X-LedgerLens-Compliance-Key`` header.\n"
-        "- **Scoped API keys** (``X-LedgerLens-Api-Key``) support ``read:scores``, "
-        "``write:suppressions``, and ``admin`` scopes with per-key rate limits.\n"
+        "LedgerLens REST API for Stellar wallet risk scoring, alert management, "
+        "AMM pool risk, cross-chain linking, and compliance exports. "
+        "See [ReDoc](/redoc) for an alternative documentation view."
     ),
     version="1.0.0",
     openapi_version="3.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
     lifespan=_lifespan,
     openapi_tags=[
         {"name": "Scores", "description": "Wallet risk score retrieval and explanation."},
@@ -179,6 +270,26 @@ app = FastAPI(
         {"name": "Compliance", "description": "FATF / SAR regulatory exports (compliance-key gated)."},
     ],
 )
+
+
+@app.middleware("http")
+async def _shutdown_guard_middleware(request: Request, call_next):
+    """Reject new requests during shutdown; track in-flight count."""
+    global _inflight_requests
+    if _shutting_down and not request.url.path.startswith("/health"):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server is shutting down."},
+            headers={"Retry-After": "5"},
+        )
+    with _inflight_lock:
+        _inflight_requests += 1
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        with _inflight_lock:
+            _inflight_requests -= 1
 
 
 @app.exception_handler(sqlite3.OperationalError)
@@ -206,12 +317,15 @@ from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
 app.include_router(admin_router)
-app.include_router(allowlist_router)
 app.include_router(api_key_router)
 
 app.include_router(batch_router)
 
 app.include_router(export_router)
+app.include_router(api_keys_router)
+
+
+app.include_router(cross_chain_router)
 
 
 class WebhookCreate(BaseModel):
@@ -238,12 +352,9 @@ v1_router = APIRouter(prefix="/v1")
 
 @v1_router.get(
     "/health",
-    tags=["Admin"],
-    summary="API health check",
-    description=(
-        "Returns 200 when healthy, 503 when any hard-failure component check fails. "
-        "Checks DB connectivity, model files, and circuit breaker states."
-    ),
+    tags=["System"],
+    summary="Health check",
+    description="Returns 200 (ok/degraded) or 503. Checks DB, model files, and circuit breakers.",
 )
 def health() -> JSONResponse:
     """Returns 200 when healthy, 503 when any hard-failure component check fails.
@@ -257,8 +368,8 @@ def health() -> JSONResponse:
       service is still serving traffic in a reduced-functionality state,
       not failed) — only DB/model failures return 503.
 
-    The response body names every component but never leaks local filesystem
-    paths — errors are logged server-side at ERROR level.
+    Returns 503 when any check fails or when soroban_circuit_status=="open",
+    drift_status=="drifted", or webhook_dead_letter_count > 0.
     """
     from detection.model_inference import _MODEL_FILENAMES
     from detection.storage import _connect
@@ -324,17 +435,130 @@ def _model_file_ok(path: str) -> bool:
         return False
 
 
-@v1_router.get(
-    "/scores",
-    response_model=list[RiskScore],
-    tags=["Scores"],
-    summary="List latest wallet risk scores",
-    description=(
-        "Return the most recent risk score for each (wallet, asset_pair) pair, "
-        "filtered by minimum score, Benford/ML flags, and sorted by the chosen field. "
-        "Supports pagination via ``limit`` and ``offset``."
-    ),
-)
+@app.get("/health/ready")
+def health_ready() -> JSONResponse:
+    """Kubernetes readiness probe. Returns 503 during shutdown."""
+    if _shutting_down:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "shutting_down"},
+        )
+    return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+# ---------------------------------------------------------------------------
+# Analyst feedback endpoints
+# ---------------------------------------------------------------------------
+
+class FeedbackSubmission(BaseModel):
+    wallet: str
+    asset_pair: str
+    analyst_label: int
+    confidence: float = 1.0
+
+
+class FeedbackRecordOut(BaseModel):
+    id: int
+    wallet: str
+    asset_pair: str
+    analyst_label: int
+    original_score: int
+    confidence: float
+    importance_weight: float
+    has_feature_vector: bool
+    created_at: str
+
+
+class PaginatedFeedback(BaseModel):
+    records: list[FeedbackRecordOut]
+    total: int
+    page: int
+    page_size: int
+
+
+_feedback_rate_buckets: dict[str, list[float]] = defaultdict(list)
+_FEEDBACK_RATE_LIMIT = 100
+_FEEDBACK_RATE_WINDOW = 3600.0
+
+
+def _check_feedback_rate_limit(client_ip: str) -> None:
+    now = time.monotonic()
+    bucket = _feedback_rate_buckets[client_ip]
+    _feedback_rate_buckets[client_ip] = [t for t in bucket if now - t < _FEEDBACK_RATE_WINDOW]
+    if len(_feedback_rate_buckets[client_ip]) >= _FEEDBACK_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded: 100 corrections per hour.")
+    _feedback_rate_buckets[client_ip].append(now)
+
+
+@v1_router.post("/feedback", status_code=201, response_model=FeedbackRecordOut,
+                dependencies=[Depends(require_admin_key)])
+def submit_analyst_feedback(payload: FeedbackSubmission, request: Request):
+    """Submit an analyst label correction. Admin-key required."""
+    _check_feedback_rate_limit(request.client.host if request.client else "unknown")
+
+    if not _STELLAR_ADDRESS_PATTERN.match(payload.wallet):
+        raise HTTPException(status_code=422, detail="Invalid Stellar wallet address format.")
+    if payload.analyst_label not in (0, 1):
+        raise HTTPException(status_code=422, detail="analyst_label must be 0 or 1.")
+    if not (0.0 <= payload.confidence <= 1.0):
+        raise HTTPException(status_code=422, detail="confidence must be in [0.0, 1.0].")
+
+    store = AnalystFeedbackStore(db_path=settings.db_path)
+
+    scores = get_latest_scores(wallet=payload.wallet, limit=1)
+    original_score = scores[0].score if scores else 0
+
+    record = store.add_correction(
+        wallet=payload.wallet,
+        asset_pair=payload.asset_pair,
+        analyst_label=payload.analyst_label,
+        original_score=original_score,
+        confidence=payload.confidence,
+    )
+    return FeedbackRecordOut(
+        id=record.id,
+        wallet=record.wallet,
+        asset_pair=record.asset_pair,
+        analyst_label=record.analyst_label,
+        original_score=record.original_score,
+        confidence=record.confidence,
+        importance_weight=record.importance_weight,
+        has_feature_vector=record.has_feature_vector,
+        created_at=record.created_at.isoformat(),
+    )
+
+
+@v1_router.get("/feedback", response_model=PaginatedFeedback,
+               dependencies=[Depends(require_admin_key)])
+def list_analyst_feedback(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    """Paginated correction history (most recent first). Admin-key required."""
+    store = AnalystFeedbackStore(db_path=settings.db_path)
+    records, total = store.get_corrections_paginated(page=page, page_size=page_size)
+    return PaginatedFeedback(
+        records=[
+            FeedbackRecordOut(
+                id=r.id,
+                wallet=r.wallet,
+                asset_pair=r.asset_pair,
+                analyst_label=r.analyst_label,
+                original_score=r.original_score,
+                confidence=r.confidence,
+                importance_weight=r.importance_weight,
+                has_feature_vector=r.has_feature_vector,
+                created_at=r.created_at.isoformat(),
+            )
+            for r in records
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@v1_router.get("/scores", response_model=list[RiskScore])
 def list_scores(
     min_score: int = 0,
     limit: int = Query(default=100, ge=1, le=1000),
@@ -373,44 +597,114 @@ def list_scores(
 
 
 
+class ShapExplanationResponse(BaseModel):
+    """Response schema for GET /scores/{wallet}/explain (waterfall-style)."""
+
+    wallet: str
+    model_version: str
+    model_name: str
+    base_value: float
+    contributions: list[dict]
+    summary_sentence: str
+
+
 @v1_router.get(
     "/scores/{wallet}/explain",
-    tags=["Scores"],
-    summary="SHAP feature explanations for a wallet",
-    description=(
-        "Return the top-5 SHAP feature contributions for ``wallet`` on ``asset_pair``. "
-        "Requires models to be loaded at startup. "
-        "Returns a list of ``{feature, shap_value}`` objects ordered by absolute contribution."
-    ),
+    response_model=ShapExplanationResponse,
 )
 def explain_wallet_score(
     wallet: str,
     asset_pair: str = Query(..., description="Asset pair to explain, e.g. XLM/USDC"),
-) -> list[dict]:
-    """Return the top-5 SHAP feature contributions for ``wallet`` on ``asset_pair``.
+    model: str = Query(
+        default="random_forest",
+        description="Model to use for SHAP explanation (random_forest, xgboost, or lightgbm)",
+    ),
+) -> ShapExplanationResponse:
+    """Return a waterfall-style SHAP explanation for ``wallet`` on ``asset_pair``.
 
-    The wallet parameter must be a valid Stellar account ID (56 characters, starting
-    with 'G', containing only base32 characters A-Z and 2-7).
+    Produces ranked per-feature SHAP contributions, the SHAP base value
+    (expected model output), and a human-readable summary sentence.
 
-    Response schema: list of ``{"feature": str, "shap_value": float}`` ordered
-    by absolute SHAP contribution descending.
+    Requires ``X-LedgerLens-Admin-Key`` header for authentication.
 
-    - **200** — cache hit: returns up to 5 feature contributions.
-    - **404** — no SHAP cache found for the given wallet / asset pair combination.
-    - **503** — models were not loaded at startup (run the training pipeline first).
+    - **200** — waterfall explanation returned.
+    - **404** — no feature vector or scores found for the given wallet.
+    - **422** — unknown ``model`` name.
+    - **503** — models were not loaded at startup.
     """
+    from detection.shap_explainer import ShapExplainer, VALID_MODEL_NAMES
+
     if not _models:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    with start_span("redis.shap_lookup", attributes={"wallet": wallet, "asset_pair": asset_pair}):
-        cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
-    if cached is None:
+
+    if model not in VALID_MODEL_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown model '{model}'. Valid models: {sorted(VALID_MODEL_NAMES)}",
+        )
+
+    # Fetch the stored feature vector for the wallet / asset pair
+    feature_vector = get_feature_vector(wallet, asset_pair)
+    if feature_vector is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
+            detail=f"No scores found for wallet {wallet}",
         )
-    return cached
+
+    # Validate feature vector: reject NaN/inf values
+    import math
+    for name, val in feature_vector.items():
+        if isinstance(val, (int, float)) and not math.isfinite(val):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Feature '{name}' has non-finite value; cannot compute SHAP explanation.",
+            )
+
+    # Get model version for cache keying
+    from detection.model_registry import get_current_version
+    model_version = get_current_version(model, settings.model_dir) or "unknown"
+
+    model_obj = _models.get(model)
+    if model_obj is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model '{model}' is not currently loaded.",
+        )
+
+    # Model name for summary sentence
+    model_display_names = {
+        "random_forest": "Random Forest",
+        "xgboost": "XGBoost",
+        "lightgbm": "LightGBM",
+    }
+    model_display = model_display_names.get(model, model)
+
+    explainer = ShapExplainer()
+    with start_span("model.shap_explain", attributes={"wallet": wallet, "model": model}):
+        explanation = explainer.explain(
+            model_obj,
+            feature_vector,
+            wallet=wallet,
+            model_version=model_version,
+            model_name=model_display,
+        )
+
+    return ShapExplanationResponse(
+        wallet=explanation.wallet,
+        model_version=explanation.model_version,
+        model_name=explanation.model_name,
+        base_value=explanation.base_value,
+        contributions=[
+            {"feature": c.feature, "shap_value": c.shap_value, "rank": c.rank}
+            for c in explanation.contributions
+        ],
+        summary_sentence=explanation.summary_sentence,
+    )
+
+
+_stream_rate_limiter_state: dict = {}
 
 
 class RateLimiterStatus(BaseModel):
@@ -426,6 +720,9 @@ class RateLimiterStatus(BaseModel):
     "/stream/rate-limiter",
     response_model=RateLimiterStatus,
     dependencies=[Depends(require_admin_key)],
+    tags=["System"],
+    summary="Stream rate-limiter status",
+    description="Return current Horizon stream rate limiter and backpressure state (admin only).",
 )
 def rate_limiter_status() -> RateLimiterStatus:
     """Return current rate limiter and backpressure state.
@@ -456,15 +753,48 @@ def rate_limiter_status() -> RateLimiterStatus:
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
 _counterfactual_executor = ThreadPoolExecutor(max_workers=4)
 
+# ---------------------------------------------------------------------------
+# Stream status — lightweight ingestion telemetry.
+# ---------------------------------------------------------------------------
+_stream_status: dict = {
+    "last_trade_at": None,
+    "trades_per_second": 0.0,
+    "active_wallets": 0,
+    "_recent_timestamps": [],
+}
+
+
+def _stream_status_update(trade) -> None:
+    """Update in-memory stream status after each ingested trade."""
+    now = time.time()
+    _stream_status["last_trade_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    recent = [t for t in _stream_status["_recent_timestamps"] if now - t < 10.0]
+    recent.append(now)
+    _stream_status["_recent_timestamps"] = recent
+    _stream_status["trades_per_second"] = len(recent) / 10.0
+    wallet = getattr(trade, "base_account", None) or ""
+    if wallet:
+        wallets = _stream_status.get("_active_wallets") or set()
+        wallets.add(wallet)
+        _stream_status["_active_wallets"] = wallets
+        _stream_status["active_wallets"] = len(wallets)
+
+
+@app.get("/stream/status")
+def stream_status() -> dict:
+    """Return real-time ingestion statistics (trades/s, active wallets, last trade time)."""
+    return {
+        "trades_per_second": _stream_status["trades_per_second"],
+        "active_wallets": _stream_status["active_wallets"],
+        "last_trade_at": _stream_status["last_trade_at"],
+    }
+
 
 @v1_router.get(
     "/scores/{wallet}/counterfactual",
     tags=["Scores"],
-    summary="Counterfactual feature changes to lower risk score",
-    description=(
-        "Return up to ``n`` minimal feature changes that would drop ``wallet``'s score "
-        "below ``target_score``. Hard-capped at 5 seconds; returns empty list on timeout."
-    ),
+    summary="Counterfactual score scenarios",
+    description="Return minimal feature changes that would lower a wallet's risk score below the target threshold.",
 )
 def wallet_counterfactual(
     wallet: str,
@@ -531,44 +861,41 @@ def wallet_counterfactual(
     }
 
 
-@v1_router.get(
-    "/scores/{wallet}",
-    tags=["Scores"],
-    summary="Latest scores for a wallet",
-    description=(
-        "Return the latest score for ``wallet`` on each asset pair. "
-        "If the wallet has an active allowlist entry the score is overridden to 0; "
-        "if it has an active denylist entry the score is overridden to 100. "
-        "Cross-chain EVM links are included when bridge transfer records exist."
-    ),
-)
+@v1_router.get("/scores/{wallet}", dependencies=[Depends(require_scope("read:scores"))])
 def wallet_scores(wallet: str) -> dict:
     """Return the latest score for `wallet` on each asset pair.
 
     Applies allowlist / denylist overrides from the ``wallet_overrides`` table.
     When the wallet has known EVM counterparts (bridge transfer records in the
     database), the response includes a ``"cross_chain_links"`` field listing
-    the linked EVM wallets and the chain they were last seen on.
+    the linked EVM wallets and the chain they were last seen on.  EVM RPC
+    endpoint URLs are never exposed in this response.
+
+    If the wallet is allowlisted, all scores are overridden to 0.
+    If denylisted, all scores are overridden to 100.
     """
+    from detection.wallet_override_store import get_active_override
+
     validate_stellar_address(wallet)
 
-    # Check for active override before querying scores (#181)
-    override = get_active_wallet_override(wallet)
-    if override is not None:
-        override_type = override["list_type"]
-        overridden_score = 0 if override_type == "allowlist" else 100
+    # Check for manual override before hitting the score store
+    override_entry = get_active_override(wallet)
+    if override_entry:
+        list_type = override_entry["list_type"]
+        override_score = 0 if list_type == "allowlist" else 100
+        override_label = list_type[:-4]  # "allowlist" → "allow", handled below
+        override_label = "allowlisted" if list_type == "allowlist" else "denylisted"
         return {
             "scores": [
                 {
                     "wallet": wallet,
-                    "score": overridden_score,
-                    "override": override_type + "ed",
-                    "reason": override["reason"],
-                    "added_by": override["added_by"],
-                    "added_at": override["added_at"],
+                    "score": override_score,
+                    "override": override_label,
+                    "reason": override_entry.get("reason", ""),
                 }
             ],
             "cross_chain_links": [],
+            "override": override_label,
         }
 
     scores = get_latest_scores(wallet=wallet)
@@ -602,9 +929,9 @@ def wallet_scores(wallet: str) -> dict:
 
 @v1_router.get(
     "/wallets/{wallet}/cross-chain",
-    tags=["Scores"],
-    summary="Cross-chain bridge transfer history",
-    description="Return the full bridge transfer history for ``wallet`` across all supported EVM chains.",
+    tags=["Wallets"],
+    summary="Cross-chain bridge history",
+    description="Return full EVM bridge transfer history for a Stellar wallet.",
 )
 def wallet_cross_chain(wallet: str) -> list[dict]:
     """Return the full bridge transfer history for ``wallet``.
@@ -618,16 +945,17 @@ def wallet_cross_chain(wallet: str) -> list[dict]:
     return history
 
 
-@v1_router.get(
-    "/alerts",
-    tags=["Alerts"],
-    summary="List manipulation alerts",
-    description=(
-        "Without ``alert_type``, returns ``RiskScore`` records at or above the threshold. "
-        "With ``alert_type``, returns stored typed alerts such as ``SANDWICH_ATTACK`` or "
-        "``WASH_TRADING``, most recent first."
-    ),
-)
+@v1_router.get("/alerts/dedup-state/{wallet}", tags=["Alerts"])
+def alert_dedup_state(wallet: str) -> dict:
+    """Return the current deduplication state and event history for a wallet."""
+    from detection.alert_engine import AlertDeduplicator
+    deduplicator = AlertDeduplicator()
+    state = deduplicator.get_state(wallet)
+    events = deduplicator.get_events(wallet)
+    return {"state": state, "events": events}
+
+
+@v1_router.get("/alerts")
 def alerts(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -654,9 +982,9 @@ def alerts(
 
 @v1_router.get(
     "/assets/risk-ranking",
-    tags=["Scores"],
-    summary="Asset pairs ranked by average wallet risk",
-    description="Return each asset pair ranked by its average wallet risk score (descending).",
+    tags=["Assets"],
+    summary="Asset pair risk ranking",
+    description="Return each asset pair ranked by average wallet risk score, descending.",
 )
 def asset_risk_ranking() -> list[dict]:
     """Return each asset pair ranked by its average wallet risk score (descending)."""
@@ -674,8 +1002,8 @@ def asset_risk_ranking() -> list[dict]:
 
 @v1_router.get(
     "/rings",
-    tags=["Alerts"],
-    summary="Detected wash-trading rings",
+    tags=["Detection"],
+    summary="Wash-trading rings",
     description="Return detected wash-trading rings from the latest pipeline run.",
 )
 def list_rings() -> list[dict]:
@@ -685,12 +1013,9 @@ def list_rings() -> list[dict]:
 
 @v1_router.get(
     "/correlations",
-    tags=["Alerts"],
+    tags=["Detection"],
     summary="Correlated asset pairs",
-    description=(
-        "Return the most recent set of correlated asset pairs from the pipeline, "
-        "including Spearman correlation coefficient, method, and shared wallet burst windows."
-    ),
+    description="Return correlated asset pairs with Spearman coefficient, shared wallet count, and run timestamp.",
 )
 def list_correlations() -> list[dict]:
     """Return the most recent set of correlated asset pairs from the pipeline.
@@ -702,12 +1027,34 @@ def list_correlations() -> list[dict]:
     return get_pair_correlations()
 
 
-@v1_router.get(
-    "/amm/pools/{pool_id}/risk",
-    tags=["AMM / Pools"],
-    summary="Pool-level round-trip and concentration risk",
-    description="Return pool-level round-trip ratio and trader concentration for ``pool_id``.",
-)
+@v1_router.get("/amm-anomalies")
+def list_amm_anomalies(
+    min_score: float = Query(0.5, ge=0.0, le=1.0),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
+    """Return AMM wash-trade anomalies ordered by anomaly_score DESC."""
+    from detection.amm_engine import AMMEngine
+
+    engine = AMMEngine()
+    anomalies = engine.get_anomalies(min_score=min_score, limit=limit, offset=offset)
+    return [
+        {
+            "wallet": a.wallet,
+            "pool_id": a.pool_id,
+            "session_start": a.session_start.isoformat() if a.session_start else None,
+            "tenure_seconds": a.tenure_seconds,
+            "volume_to_liquidity_ratio": a.volume_to_liquidity_ratio,
+            "deposit_withdraw_symmetry": a.deposit_withdraw_symmetry,
+            "counterparty_concentration": a.counterparty_concentration,
+            "anomaly_score": a.anomaly_score,
+            "detected_at": a.detected_at.isoformat() if a.detected_at else None,
+        }
+        for a in anomalies
+    ]
+
+
+@v1_router.get("/amm/pools/{pool_id}/risk")
 def pool_risk(pool_id: str) -> dict:
     """Return pool-level round-trip ratio and trader concentration for `pool_id`.
 
@@ -723,8 +1070,8 @@ def pool_risk(pool_id: str) -> dict:
 
 @v1_router.get(
     "/path-payments/circular",
-    tags=["Alerts"],
-    summary="Atomic circular path-payment routes",
+    tags=["Detection"],
+    summary="Circular path payments",
     description="Return detected atomic circular path-payment routes, paginated.",
 )
 def circular_path_payments(
@@ -762,13 +1109,10 @@ class FeedbackRequest(BaseModel):
 
 @v1_router.post(
     "/feedback",
-    tags=["Admin"],
-    summary="Submit ground-truth feedback for a scored wallet",
-    description=(
-        "Record ground-truth feedback for a previously scored wallet/asset_pair. "
-        "Writes one ScoringFeedback row per model (3 total). Requires admin key."
-    ),
     dependencies=[Depends(require_admin_key)],
+    tags=["Admin"],
+    summary="Submit scoring feedback",
+    description="Record ground-truth feedback (confirmed wash / confirmed clean) for a previously scored wallet.",
 )
 def submit_feedback(body: FeedbackRequest) -> dict:
     """Record ground-truth feedback for a previously scored wallet/asset_pair.
@@ -835,25 +1179,13 @@ def submit_feedback(body: FeedbackRequest) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@v1_router.get(
-    "/admin/drift-reports",
-    tags=["Admin"],
-    summary="Distribution drift reports",
-    description="Return the most recent PSI-based drift checks recorded by ``retrain-check``. Admin-key gated.",
-    dependencies=[Depends(require_admin_key)],
-)
+@v1_router.get("/admin/drift-reports", tags=["Admin"], summary="Model drift reports", description="Return the most recent drift checks recorded by `cli.py retrain-check`.", dependencies=[Depends(require_admin_key)])
 def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     """Return the most recent drift checks recorded by `cli.py retrain-check`."""
     return get_drift_reports(limit=limit)
 
 
-@v1_router.get(
-    "/admin/robustness-report",
-    tags=["Admin"],
-    summary="Latest adversarial robustness report",
-    description="Return the latest RobustnessReport from the database. Admin-key gated.",
-    dependencies=[Depends(require_admin_key)],
-)
+@v1_router.get("/admin/robustness-report", tags=["Admin"], summary="Latest robustness report", description="Return the latest adversarial robustness evaluation report (admin only).", dependencies=[Depends(require_admin_key)])
 def robustness_report() -> dict:
     """Return the latest RobustnessReport from the database (admin only)."""
     from detection.storage import get_latest_robustness_report
@@ -864,15 +1196,7 @@ def robustness_report() -> dict:
     return report
 
 
-@v1_router.get(
-    "/model/robustness",
-    tags=["Admin"],
-    summary="Live adversarial red-team robustness metrics",
-    description=(
-        "Return live red team robustness metrics: ``evasion_rate_24h``, "
-        "``mean_generations_to_evade``, and ``hardening_delta``."
-    ),
-)
+@v1_router.get("/model/robustness", tags=["Admin"], summary="Live robustness metrics", description="Return live red-team robustness metrics: evasion rate, mean generations to evade, and hardening delta.")
 def model_robustness() -> dict:
     """Return live red team robustness metrics for the current model.
 
@@ -885,13 +1209,7 @@ def model_robustness() -> dict:
     return live_robustness_metrics()
 
 
-@v1_router.get(
-    "/admin/retrain-runs",
-    tags=["Admin"],
-    summary="Per-model retrain outcomes",
-    description="Return the most recent per-model retrain outcomes, optionally filtered by model name. Admin-key gated.",
-    dependencies=[Depends(require_admin_key)],
-)
+@v1_router.get("/admin/retrain-runs", tags=["Admin"], summary="Retrain run history", description="Return the most recent per-model retrain outcomes.", dependencies=[Depends(require_admin_key)])
 def retrain_runs(
     limit: int = Query(default=50, ge=1, le=1000),
     model_name: str | None = Query(default=None, description="Filter by model, e.g. random_forest"),
@@ -900,13 +1218,7 @@ def retrain_runs(
     return get_retrain_runs(limit=limit, model_name=model_name)
 
 
-@v1_router.get(
-    "/admin/federated/audit-log",
-    tags=["Admin"],
-    summary="Federated learning round audit log",
-    description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed). Admin-key gated.",
-    dependencies=[Depends(require_admin_key)],
-)
+@v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),
 ) -> list[dict]:
@@ -931,12 +1243,7 @@ def admin_namespaces() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@v1_router.get(
-    "/model/weights",
-    tags=["Admin"],
-    summary="Current ensemble classifier weights",
-    description="Return current ensemble classifier weights from the adaptive Thompson-sampling reweighter.",
-)
+@v1_router.get("/model/weights", tags=["Admin"], summary="Ensemble model weights", description="Return current ensemble classifier weights from the Thompson-sampling adaptive reweighter.")
 def model_weights() -> JSONResponse:
     """Return current ensemble classifier weights from the adaptive reweighter."""
     from detection.adaptive_reweighter import (
@@ -974,11 +1281,8 @@ def model_weights() -> JSONResponse:
     "/webhooks",
     status_code=201,
     tags=["Webhooks"],
-    summary="Register a new webhook subscriber",
-    description=(
-        "Register a new webhook subscriber with optional wallet and asset pair filters. "
-        "The secret is AES-256-GCM encrypted at rest."
-    ),
+    summary="Register webhook subscriber",
+    description="Register a URL to receive risk score alert notifications above a configurable threshold.",
 )
 def create_webhook(body: WebhookCreate) -> dict:
     """Register a new webhook subscriber."""
@@ -995,12 +1299,7 @@ def create_webhook(body: WebhookCreate) -> dict:
     return {"subscriber_id": subscriber_id}
 
 
-@v1_router.get(
-    "/webhooks",
-    tags=["Webhooks"],
-    summary="List active webhook subscribers",
-    description="Return all active webhook subscribers. Secrets are masked.",
-)
+@v1_router.get("/webhooks", tags=["Webhooks"], summary="List webhooks", description="Return all active webhook subscribers (secrets masked).")
 def list_webhooks() -> list[dict]:
     """Return all active subscribers (secrets are masked)."""
     return [
@@ -1017,12 +1316,7 @@ def list_webhooks() -> list[dict]:
     ]
 
 
-@v1_router.delete(
-    "/webhooks/{subscriber_id}",
-    tags=["Webhooks"],
-    summary="Deactivate a webhook subscriber",
-    description="Deactivate a webhook subscriber by its ID.",
-)
+@v1_router.delete("/webhooks/{subscriber_id}", tags=["Webhooks"], summary="Delete webhook", description="Permanently deactivate a webhook subscriber.")
 def delete_webhook(subscriber_id: str) -> dict:
     """Deactivate a webhook subscriber."""
     if not deactivate_subscriber(subscriber_id):
@@ -1030,12 +1324,7 @@ def delete_webhook(subscriber_id: str) -> dict:
     return {"status": "deactivated"}
 
 
-@v1_router.get(
-    "/webhooks/dead-letters",
-    tags=["Webhooks"],
-    summary="Permanently failed webhook deliveries",
-    description="Return all webhook deliveries that have permanently failed after exhausting retries.",
-)
+@v1_router.get("/webhooks/dead-letters", tags=["Webhooks"], summary="Dead-letter webhooks", description="Return webhook deliveries that permanently failed after all retry attempts.")
 def dead_letters() -> list[dict]:
     """Return all deliveries that have permanently failed."""
     return [
@@ -1051,18 +1340,74 @@ def dead_letters() -> list[dict]:
     ]
 
 
+@app.get("/sandwiches")
+def get_sandwiches(
+    asset_pair: str | None = Query(None, description="Filter by asset pair"),
+    min_confidence: float = Query(0.7, ge=0.0, le=1.0, description="Minimum sandwich confidence"),
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict]:
+    """Return detected sandwich attack events from the stored risk scores.
+
+    Results are ordered newest-first and filtered by `min_confidence`.
+    """
+    from detection.storage import _connect, init_db
+    init_db()
+    with _connect() as conn:
+        query = """
+            SELECT wallet, asset_pair, score, scored_at, metadata
+            FROM risk_scores
+            WHERE metadata LIKE '%sandwich%'
+        """
+        params: list = []
+        if asset_pair:
+            query += " AND asset_pair = ?"
+            params.append(asset_pair)
+        query += " ORDER BY scored_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+
+    results = []
+    for wallet, pair, score, scored_at, metadata_json in rows:
+        try:
+            meta = json.loads(metadata_json) if metadata_json else {}
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        conf = meta.get("sandwich_confidence", 0.0)
+        if conf >= min_confidence:
+            results.append(
+                {
+                    "attacker_wallet": wallet,
+                    "asset_pair": pair,
+                    "risk_score": score,
+                    "scored_at": scored_at,
+                    "sandwich_confidence": conf,
+                    "victim_wallet": meta.get("victim_wallet"),
+                    "victim_amount": meta.get("victim_amount"),
+                    "price_impact": meta.get("price_impact"),
+                    "front_run_time": meta.get("front_run_time"),
+                    "back_run_time": meta.get("back_run_time"),
+                }
+            )
+    return results
+
+
+@app.get("/admin/gnn-stats", dependencies=[Depends(require_admin_key)])
+def gnn_stats() -> dict:
+    """Return GNN model architecture summary and last inference time."""
+    try:
+        from detection.gnn_model import GNNInferenceEngine
+        engine = GNNInferenceEngine.get_instance()
+        return engine.stats()
+    except ImportError:
+        return {"status": "unavailable", "reason": "torch_geometric not installed"}
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
 # ------------------------------------------------------------------
 # Disputes
 # ------------------------------------------------------------------
 
 
-@v1_router.post(
-    "/disputes",
-    status_code=201,
-    tags=["Disputes"],
-    summary="Submit a score dispute",
-    description="Submit a dispute for a wallet's risk score. Rate-limited to prevent abuse.",
-)
+@v1_router.post("/disputes", status_code=201, tags=["Disputes"], summary="Submit score dispute", description="Submit a dispute for a scored wallet. Rate-limited to one dispute per wallet per 24h.")
 def create_dispute(body: DisputeCreate):
     try:
         dispute = submit_dispute(body.wallet, body.asset_pair, body.evidence_url)
@@ -1071,15 +1416,10 @@ def create_dispute(body: DisputeCreate):
         if "Rate limit" in str(exc):
             raise HTTPException(status_code=429, detail=str(exc))
         raise HTTPException(status_code=422, detail=str(exc))
-    return dispute.dict()
+    return dispute.model_dump()
 
 
-@v1_router.get(
-    "/disputes/{dispute_id}",
-    tags=["Disputes"],
-    summary="Get a dispute by ID",
-    description="Return a dispute record with vote counts. Voter identities are hidden.",
-)
+@v1_router.get("/disputes/{dispute_id}", tags=["Disputes"], summary="Get dispute", description="Return dispute details including committee vote counts (identities hidden).")
 def read_dispute(dispute_id: str):
     d = get_dispute(dispute_id)
     if d is None:
@@ -1102,13 +1442,7 @@ def read_dispute(dispute_id: str):
     }
 
 
-@v1_router.post(
-    "/disputes/{dispute_id}/vote",
-    tags=["Disputes"],
-    summary="Cast a committee vote on a dispute",
-    description="Submit an approve or reject vote for a dispute. Admin-key gated.",
-    dependencies=[Depends(require_admin_key)],
-)
+@v1_router.post("/disputes/{dispute_id}/vote", dependencies=[Depends(require_admin_key)], tags=["Disputes"], summary="Vote on dispute", description="Cast an approve/reject vote on an open dispute (admin only).")
 def vote_dispute(dispute_id: str, body: VoteBody):
     # validate voter_key_hash format
     if len(body.voter_key_hash) != 64:
@@ -1119,7 +1453,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
         d = cast_vote(dispute_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return d.dict()
+    return d.model_dump()
 
 
 # ------------------------------------------------------------------
@@ -1127,14 +1461,9 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 # ------------------------------------------------------------------
 
 
-@v1_router.get(
-    "/governance/proposals",
-    tags=["Governance"],
-    summary="List open governance proposals",
-    description="Return all open on-chain governance proposals.",
-)
+@v1_router.get("/governance/proposals", tags=["Governance"], summary="List proposals", description="Return all open governance proposals.")
 def get_proposals():
-    return [p.dict() for p in list_open_proposals()]
+    return [p.model_dump() for p in list_open_proposals()]
 
 
 class ProposalCreate(BaseModel):
@@ -1142,40 +1471,32 @@ class ProposalCreate(BaseModel):
     proposed_value: str
     proposed_by_key_hash: str
 
+ProposalCreate = LegacyProposalCreate
 
-@v1_router.post(
-    "/governance/proposals",
-    tags=["Governance"],
-    summary="Create a governance proposal",
-    description="Create a new on-chain governance proposal. Admin-key gated.",
-    dependencies=[Depends(require_admin_key)],
-)
+
+@v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Create proposal", description="Create a new governance proposal (admin only).")
 def create_proposal_endpoint(body: ProposalCreate):
     try:
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 class ProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
+ProposalVote = LegacyProposalVote
 
-@v1_router.post(
-    "/governance/proposals/{proposal_id}/vote",
-    tags=["Governance"],
-    summary="Vote on a governance proposal",
-    description="Cast a vote on an open governance proposal. Admin-key gated.",
-    dependencies=[Depends(require_admin_key)],
-)
+
+@v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Vote on proposal", description="Cast a vote on a governance proposal (admin only).")
 def vote_proposal(proposal_id: str, body: ProposalVote):
     try:
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 # ------------------------------------------------------------------
@@ -1199,14 +1520,18 @@ class SARPackageRequest(BaseModel):
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
 )
-def compliance_ivms(wallet: str) -> dict:
-    """Return the IVMS 101 risk-augmentation block for ``wallet``."""
+def compliance_ivms(wallet: str, dry_run: bool = Query(False)) -> dict:
+    """Return the IVMS 101 risk-augmentation block for ``wallet``.
+
+    Logged as a Travel-Rule export to the compliance audit trail unless
+    ``dry_run=true``.
+    """
     from dataclasses import asdict
 
-    from detection.compliance_exporter import build_ivms_risk_field
+    from detection.compliance_exporter import export_travel_rule
 
     validate_stellar_address(wallet)
-    return asdict(build_ivms_risk_field(wallet))
+    return asdict(export_travel_rule(wallet, dry_run=dry_run))
 
 
 @v1_router.post(
@@ -1214,20 +1539,37 @@ def compliance_ivms(wallet: str) -> dict:
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
 )
-def compliance_sar_package(body: SARPackageRequest) -> FileResponse:
-    """Generate a SAR evidence ZIP for a wallet and return it as a download."""
+def compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)) -> FileResponse:
+    """Generate a SAR evidence ZIP for a wallet and return it as a download.
+
+    Requires the wallet's current risk score to be at least
+    ``COMPLIANCE_SAR_MIN_SCORE`` (400 otherwise) and is rate-limited to
+    ``COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR`` exports/hour (429 otherwise).
+    Logged to the compliance audit trail unless ``dry_run=true``.
+    """
     import tempfile
 
-    from detection.compliance_exporter import generate_sar_package
+    from detection.compliance_exporter import (
+        ComplianceRateLimitExceeded,
+        ComplianceScoreTooLow,
+        export_sar_package,
+    )
 
     validate_stellar_address(body.wallet)
     output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
-    zip_path = generate_sar_package(
-        wallet=body.wallet,
-        start_date=body.start_date,
-        end_date=body.end_date,
-        output_dir=output_dir,
-    )
+    try:
+        zip_path = export_sar_package(
+            wallet=body.wallet,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            output_dir=output_dir,
+            dry_run=dry_run,
+        )
+    except ComplianceScoreTooLow as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ComplianceRateLimitExceeded:
+        raise HTTPException(status_code=429, detail="Compliance export rate limit exceeded")
+
     return FileResponse(
         zip_path,
         media_type="application/zip",
@@ -1593,7 +1935,11 @@ for _path in _LEGACY_REDIRECTS:
             # Preserve query string
             qs = request.url.query
             target = f"/v1{p}" + (f"?{qs}" if qs else "")
-            return RedirectResponse(url=target, status_code=302)
+            response = RedirectResponse(url=target, status_code=302)
+            response.headers["Deprecation"] = "true"
+            response.headers["Sunset"] = "Sat, 01 Jan 2028 00:00:00 GMT"
+            response.headers["Link"] = f'</v1{p}>; rel="successor-version"'
+            return response
         _redirect.__name__ = f"legacy_redirect_{p.replace('/', '_').strip('_')}"
         return _redirect
 
@@ -1690,6 +2036,37 @@ def legacy_dispute_get(dispute_id: str, request: Request):
 @app.post("/disputes/{dispute_id}/vote", include_in_schema=False)
 def legacy_dispute_vote(dispute_id: str, request: Request):
     return RedirectResponse(url=f"/v1/disputes/{dispute_id}/vote", status_code=302)
+
+
+@app.get("/compliance/ivms/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_ivms(wallet: str) -> dict:
+    from dataclasses import asdict
+    from detection.compliance_exporter import build_ivms_risk_field
+    validate_stellar_address(wallet)
+    return asdict(build_ivms_risk_field(wallet))
+
+
+@app.post("/compliance/sar-package", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_sar_package(body: SARPackageRequest) -> FileResponse:
+    import os
+    import tempfile
+    from detection.compliance_exporter import generate_sar_package
+    from fastapi.responses import FileResponse as _FileResponse
+    output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
+    pkg_path = generate_sar_package(
+        wallet=body.wallet,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        output_dir=output_dir,
+    )
+    return _FileResponse(pkg_path, media_type="application/zip", filename=os.path.basename(pkg_path))
+
+
+@app.get("/compliance/audit-trail/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_audit_trail(wallet: str) -> list[dict]:
+    from detection.compliance_exporter import get_audit_trail
+    validate_stellar_address(wallet)
+    return get_audit_trail(wallet)
 
 
 @app.post("/governance/proposals", include_in_schema=False)

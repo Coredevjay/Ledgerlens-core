@@ -25,7 +25,7 @@ import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from ingestion.data_models import BridgeTransfer, PathPayment
+from ingestion.data_models import BridgeTransfer, PathPayment, Trade
 
 logger = logging.getLogger("ledgerlens.storage")
 
@@ -382,61 +382,23 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         14,
-        "add wallet_overrides table for allowlist/denylist with audit trail",
+        "add soroban_dead_letters table for DLQ",
         """
-        CREATE TABLE IF NOT EXISTS wallet_overrides (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            wallet TEXT NOT NULL,
-            list_type TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            added_by TEXT NOT NULL,
-            added_at TEXT NOT NULL,
-            removed_by TEXT,
-            removed_at TEXT,
-            is_active INTEGER NOT NULL DEFAULT 1
+        CREATE TABLE IF NOT EXISTS soroban_dead_letters (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet          TEXT NOT NULL,
+            asset_pair      TEXT NOT NULL,
+            score           INTEGER NOT NULL,
+            ledger_timestamp INTEGER NOT NULL,
+            error_message   TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending', 'replayed', 'failed')),
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            replayed_at     TIMESTAMP,
+            replay_tx_hash  TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_wallet_overrides_wallet ON wallet_overrides (wallet);
-        CREATE INDEX IF NOT EXISTS idx_wallet_overrides_list_type ON wallet_overrides (list_type);
-        CREATE INDEX IF NOT EXISTS idx_wallet_overrides_active ON wallet_overrides (is_active);
-        """,
-    ),
-    (
-        15,
-        "add alert_states table for deduplication engine",
-        """
-        CREATE TABLE IF NOT EXISTS alert_states (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            wallet TEXT NOT NULL,
-            alert_active INTEGER NOT NULL DEFAULT 0,
-            last_score INTEGER NOT NULL DEFAULT 0,
-            below_threshold_streak INTEGER NOT NULL DEFAULT 0,
-            opened_at TEXT,
-            last_escalated_at TEXT,
-            resolved_at TEXT,
-            updated_at TEXT NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_states_wallet ON alert_states (wallet);
-        """,
-    ),
-    (
-        16,
-        "add api_keys table for scoped API key management",
-        """
-        CREATE TABLE IF NOT EXISTS api_keys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id TEXT NOT NULL UNIQUE,
-            key_hash TEXT NOT NULL,
-            namespace_id TEXT,
-            scopes_json TEXT NOT NULL,
-            rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
-            created_at TEXT NOT NULL,
-            expires_at TEXT,
-            last_used_at TEXT,
-            revoked_at TEXT,
-            created_by TEXT NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_id ON api_keys (key_id);
-        CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);
+        CREATE INDEX IF NOT EXISTS idx_dlq_status ON soroban_dead_letters(status);
+        CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
         """,
     ),
 ]
@@ -567,6 +529,66 @@ def init_db(db_path: str | None = None) -> None:
     """Initialise or upgrade the database schema via the migration system."""
     with _connect(db_path) as conn:
         migrate_db(conn)
+
+
+class RiskScoreStore:
+    """SQLite store used by scoring and historical trade ingestion.
+
+    Historical trades are inserted in page-sized batches with
+    ``INSERT OR IGNORE`` so replayed pages and adjacent boundary duplicates
+    are harmless.
+    """
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path = db_path or settings.db_path
+        init_db(self.db_path)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 30000")
+
+    def upsert_trades(self, trades: list[Trade]) -> int:
+        """Insert validated trades, ignoring existing paging tokens."""
+        if not trades:
+            return 0
+        rows = [
+            (
+                trade.paging_token or trade.id,
+                trade.id,
+                trade.ledger_close_time.isoformat(),
+                trade.base_account,
+                trade.counter_account,
+                trade.base_asset.code,
+                trade.base_asset.issuer,
+                trade.counter_asset.code,
+                trade.counter_asset.issuer,
+                trade.base_amount,
+                trade.counter_amount,
+                trade.price,
+                int(trade.base_is_seller),
+                trade.trade_type.value,
+                trade.liquidity_pool_id,
+                trade.transaction_hash,
+                trade.path_payment_id,
+                trade.hop_index,
+            )
+            for trade in trades
+        ]
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO trades (
+                    paging_token, trade_id, ledger_close_time, base_account,
+                    counter_account, base_asset_code, base_asset_issuer,
+                    counter_asset_code, counter_asset_issuer, base_amount,
+                    counter_amount, price, base_is_seller, trade_type,
+                    liquidity_pool_id, transaction_hash, path_payment_id, hop_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return conn.total_changes - before
 
 
 def save_scores(scores: list[RiskScore], db_path: str | None = None) -> None:
@@ -1372,7 +1394,7 @@ def save_feature_state(state, db_path: str | None = None) -> None:
         db_path: Optional database path; uses settings.db_path if not provided.
     """
     init_db(db_path)
-    state_json = state.model_dump_json_compat()
+    state_json = state.model_dump_json()
     with _connect(db_path) as conn:
         conn.execute(
             """
@@ -1401,7 +1423,7 @@ def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
         return None
 
     from detection.feature_store import WalletFeatureState
-    return WalletFeatureState.model_validate_json_compat(row[0])
+    return WalletFeatureState.model_validate_json(row[0])
 
 
 def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | None = None) -> int:
@@ -1424,7 +1446,7 @@ def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | Non
     from detection.feature_store import WalletFeatureState
     for row in rows:
         try:
-            state = WalletFeatureState.model_validate_json_compat(row[0])
+            state = WalletFeatureState.model_validate_json(row[0])
             feature_store.set_state(state)
             count += 1
         except Exception as e:
@@ -1620,7 +1642,13 @@ def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
     Each alert dict must carry ``alert_type``, ``wallet``, ``asset_pair`` and a
     JSON-serialisable ``detail`` mapping; ``pool_id`` and ``timestamp`` (ISO 8601)
     are optional and default to ``None`` / now.
+
+    Suppressed wallets are silently dropped before persistence (Issue #178).
     """
+    if not alerts:
+        return
+    from detection.suppressions import filter_suppressed_alerts
+    alerts = filter_suppressed_alerts(alerts, db_path=db_path)
     if not alerts:
         return
     init_db(db_path)
@@ -1828,356 +1856,67 @@ def get_hop_payment_cycles(
     ]
 
 
-# ---------------------------------------------------------------------------
-# Wallet override (allowlist / denylist) — Issue #181
-# ---------------------------------------------------------------------------
-
-
-def add_wallet_override(
-    wallet: str,
-    list_type: str,
-    reason: str,
-    added_by: str,
+def log_krum_aggregation(
+    round_number: int,
+    n_clients: int,
+    f_tolerance: int,
+    m_selected: int,
+    selected_indices: list,
+    excluded_indices: list,
+    krum_scores: list,
     db_path: str | None = None,
-) -> dict:
-    """Insert an active allowlist or denylist entry.
-
-    If the wallet already has an active entry of the same list_type it is soft-
-    removed first so the new one becomes the canonical active record.
-    """
+) -> None:
+    """Persist one Krum aggregation round decision to fl_aggregation_log."""
     init_db(db_path)
-    now = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
         conn.execute(
             """
-            UPDATE wallet_overrides
-               SET is_active = 0, removed_by = ?, removed_at = ?
-             WHERE wallet = ? AND list_type = ? AND is_active = 1
+            INSERT INTO fl_aggregation_log
+              (round_number, n_clients, f_tolerance, m_selected,
+               selected_indices, excluded_indices, krum_scores, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (added_by, now, wallet, list_type),
-        )
-        cursor = conn.execute(
-            """
-            INSERT INTO wallet_overrides (wallet, list_type, reason, added_by, added_at, is_active)
-            VALUES (?, ?, ?, ?, ?, 1)
-            """,
-            (wallet, list_type, reason, added_by, now),
-        )
-        conn.commit()
-        row_id = cursor.lastrowid
-
-    return {
-        "id": row_id,
-        "wallet": wallet,
-        "list_type": list_type,
-        "reason": reason,
-        "added_by": added_by,
-        "added_at": now,
-    }
-
-
-def remove_wallet_override(
-    wallet: str,
-    list_type: str,
-    removed_by: str,
-    db_path: str | None = None,
-) -> bool:
-    """Soft-delete the active override for ``wallet`` of ``list_type``.
-
-    Returns True if an active entry was found and soft-deleted, False otherwise.
-    """
-    init_db(db_path)
-    now = datetime.now(timezone.utc).isoformat()
-    with _connect(db_path) as conn:
-        cursor = conn.execute(
-            """
-            UPDATE wallet_overrides
-               SET is_active = 0, removed_by = ?, removed_at = ?
-             WHERE wallet = ? AND list_type = ? AND is_active = 1
-            """,
-            (removed_by, now, wallet, list_type),
+            (
+                round_number,
+                n_clients,
+                f_tolerance,
+                m_selected,
+                json.dumps(selected_indices),
+                json.dumps(excluded_indices),
+                json.dumps([float(s) for s in krum_scores]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
         conn.commit()
-    return cursor.rowcount > 0
 
 
-def get_wallet_overrides(
-    list_type: str,
-    include_removed: bool = False,
-    limit: int = 100,
-    offset: int = 0,
+def get_krum_aggregation_log(
+    limit: int = 10,
     db_path: str | None = None,
 ) -> list[dict]:
-    """Return override entries for ``list_type`` (allowlist or denylist).
-
-    When ``include_removed`` is False (default) only active entries are returned.
-    Soft-deleted rows always appear with a ``removed_at`` timestamp.
-    """
-    init_db(db_path)
-    conditions = ["list_type = ?"]
-    params: list = [list_type]
-    if not include_removed:
-        conditions.append("is_active = 1")
-    where = "WHERE " + " AND ".join(conditions)
-
-    with _connect(db_path) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, wallet, list_type, reason, added_by, added_at,
-                   removed_by, removed_at, is_active
-              FROM wallet_overrides
-             {where}
-             ORDER BY added_at DESC
-             LIMIT ? OFFSET ?
-            """,
-            tuple(params) + (limit, offset),
-        ).fetchall()
-
-    return [
-        {
-            "id": r[0],
-            "wallet": r[1],
-            "list_type": r[2],
-            "reason": r[3],
-            "added_by": r[4],
-            "added_at": r[5],
-            "removed_by": r[6],
-            "removed_at": r[7],
-            "is_active": bool(r[8]),
-        }
-        for r in rows
-    ]
-
-
-def get_active_wallet_override(
-    wallet: str,
-    db_path: str | None = None,
-) -> dict | None:
-    """Return the active override record for ``wallet``, or None.
-
-    Checks both allowlist and denylist; returns the most recently added active
-    entry so callers can determine which override applies.
-    """
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT id, wallet, list_type, reason, added_by, added_at
-              FROM wallet_overrides
-             WHERE wallet = ? AND is_active = 1
-             ORDER BY added_at DESC
-             LIMIT 1
-            """,
-            (wallet,),
-        ).fetchone()
-
-    if row is None:
-        return None
-    return {
-        "id": row[0],
-        "wallet": row[1],
-        "list_type": row[2],
-        "reason": row[3],
-        "added_by": row[4],
-        "added_at": row[5],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Alert deduplication state — Issue #177
-# ---------------------------------------------------------------------------
-
-
-def get_alert_state(wallet: str, db_path: str | None = None) -> dict | None:
-    """Return the current deduplication state for ``wallet``, or None if absent."""
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT wallet, alert_active, last_score, below_threshold_streak,
-                   opened_at, last_escalated_at, resolved_at, updated_at
-              FROM alert_states
-             WHERE wallet = ?
-            """,
-            (wallet,),
-        ).fetchone()
-
-    if row is None:
-        return None
-    return {
-        "wallet": row[0],
-        "alert_active": bool(row[1]),
-        "last_score": row[2],
-        "below_threshold_streak": row[3],
-        "opened_at": row[4],
-        "last_escalated_at": row[5],
-        "resolved_at": row[6],
-        "updated_at": row[7],
-    }
-
-
-def save_alert_state(state: dict, db_path: str | None = None) -> None:
-    """Upsert the deduplication state for ``state["wallet"]``."""
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO alert_states
-                (wallet, alert_active, last_score, below_threshold_streak,
-                 opened_at, last_escalated_at, resolved_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(wallet) DO UPDATE SET
-                alert_active           = excluded.alert_active,
-                last_score             = excluded.last_score,
-                below_threshold_streak = excluded.below_threshold_streak,
-                opened_at              = excluded.opened_at,
-                last_escalated_at      = excluded.last_escalated_at,
-                resolved_at            = excluded.resolved_at,
-                updated_at             = excluded.updated_at
-            """,
-            (
-                state["wallet"],
-                int(state["alert_active"]),
-                state["last_score"],
-                state["below_threshold_streak"],
-                state.get("opened_at"),
-                state.get("last_escalated_at"),
-                state.get("resolved_at"),
-                state["updated_at"],
-            ),
-        )
-        conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# API key management — Issue #195
-# ---------------------------------------------------------------------------
-
-
-def create_api_key(
-    key_id: str,
-    key_hash: str,
-    scopes: list[str],
-    created_by: str,
-    namespace_id: str | None = None,
-    rate_limit_per_minute: int = 60,
-    expires_at: str | None = None,
-    db_path: str | None = None,
-) -> dict:
-    """Persist a new API key record (plaintext key is NOT stored)."""
-    init_db(db_path)
-    now = datetime.now(timezone.utc).isoformat()
-    with _connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO api_keys
-                (key_id, key_hash, namespace_id, scopes_json, rate_limit_per_minute,
-                 created_at, expires_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                key_id,
-                key_hash,
-                namespace_id,
-                json.dumps(scopes),
-                rate_limit_per_minute,
-                now,
-                expires_at,
-                created_by,
-            ),
-        )
-        conn.commit()
-
-    return {
-        "key_id": key_id,
-        "namespace_id": namespace_id,
-        "scopes": scopes,
-        "rate_limit_per_minute": rate_limit_per_minute,
-        "created_at": now,
-        "expires_at": expires_at,
-        "created_by": created_by,
-    }
-
-
-def revoke_api_key(key_id: str, db_path: str | None = None) -> bool:
-    """Mark ``key_id`` as revoked. Returns True if the key existed."""
-    init_db(db_path)
-    now = datetime.now(timezone.utc).isoformat()
-    with _connect(db_path) as conn:
-        cursor = conn.execute(
-            "UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL",
-            (now, key_id),
-        )
-        conn.commit()
-    return cursor.rowcount > 0
-
-
-def get_api_key_by_hash(key_hash: str, db_path: str | None = None) -> dict | None:
-    """Look up an API key by its BLAKE2b hash. Returns None if not found."""
-    init_db(db_path)
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT key_id, key_hash, namespace_id, scopes_json, rate_limit_per_minute,
-                   created_at, expires_at, last_used_at, revoked_at, created_by
-              FROM api_keys
-             WHERE key_hash = ?
-            """,
-            (key_hash,),
-        ).fetchone()
-
-    if row is None:
-        return None
-    return {
-        "key_id": row[0],
-        "key_hash": row[1],
-        "namespace_id": row[2],
-        "scopes": json.loads(row[3]),
-        "rate_limit_per_minute": row[4],
-        "created_at": row[5],
-        "expires_at": row[6],
-        "last_used_at": row[7],
-        "revoked_at": row[8],
-        "created_by": row[9],
-    }
-
-
-def touch_api_key_last_used(key_id: str, db_path: str | None = None) -> None:
-    """Update ``last_used_at`` for ``key_id``."""
-    init_db(db_path)
-    now = datetime.now(timezone.utc).isoformat()
-    with _connect(db_path) as conn:
-        conn.execute(
-            "UPDATE api_keys SET last_used_at = ? WHERE key_id = ?",
-            (now, key_id),
-        )
-        conn.commit()
-
-
-def list_api_keys(db_path: str | None = None) -> list[dict]:
-    """Return all non-revoked API key records (key hashes are NOT returned)."""
+    """Return the most recent Krum aggregation rounds, newest first."""
     init_db(db_path)
     with _connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT key_id, namespace_id, scopes_json, rate_limit_per_minute,
-                   created_at, expires_at, last_used_at, created_by
-              FROM api_keys
-             WHERE revoked_at IS NULL
-             ORDER BY created_at DESC
-            """
+            SELECT round_number, n_clients, f_tolerance, m_selected,
+                   selected_indices, excluded_indices, krum_scores, recorded_at
+            FROM fl_aggregation_log
+            ORDER BY round_number DESC
+            LIMIT ?
+            """,
+            (limit,),
         ).fetchall()
-
     return [
         {
-            "key_id": r[0],
-            "namespace_id": r[1],
-            "scopes": json.loads(r[2]),
-            "rate_limit_per_minute": r[3],
-            "created_at": r[4],
-            "expires_at": r[5],
-            "last_used_at": r[6],
-            "created_by": r[7],
+            "round_number": r[0],
+            "n_clients": r[1],
+            "f_tolerance": r[2],
+            "m_selected": r[3],
+            "selected_indices": json.loads(r[4]),
+            "excluded_indices": json.loads(r[5]),
+            "krum_scores": json.loads(r[6]),
+            "recorded_at": r[7],
         }
         for r in rows
     ]

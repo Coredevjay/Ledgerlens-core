@@ -1,125 +1,101 @@
-"""API key management with scoped permissions and per-key rate limits — Issue #195.
+"""API key management endpoints and scope/rate-limit enforcement (Issue #195)."""
 
-Implements production-grade access control replacing the single
-``LEDGERLENS_API_KEY`` environment variable:
+from __future__ import annotations
 
-- ``POST /admin/api-keys``        — create a key; plaintext returned once.
-- ``GET  /admin/api-keys``        — list active keys (no hashes exposed).
-- ``DELETE /admin/api-keys/{id}`` — revoke a key immediately.
+from typing import Optional
 
-Keys are validated on each request via :func:`api.auth.require_api_key_scope`.
-The plaintext key is hashed with BLAKE2b (256-bit) before storage; the hash
-is never exposed after creation.
-
-Rate limiting uses a Redis sliding-window counter when Redis is reachable and
-falls back to an in-process TTL dict when it is not.
-"""
-
-import hashlib
-import secrets
-import logging
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from api.auth import require_admin_key
-from detection.storage import (
+from detection.api_key_store import (
+    check_rate_limit,
     create_api_key,
     list_api_keys,
+    lookup_key,
     revoke_api_key,
 )
 
-logger = logging.getLogger("ledgerlens.api_key_router")
-
-router = APIRouter(
-    prefix="/admin",
-    tags=["API Key Management"],
-    dependencies=[Depends(require_admin_key)],
-)
-
-_VALID_SCOPES = frozenset(["read:scores", "write:suppressions", "admin"])
+router = APIRouter(prefix="/admin/api-keys", tags=["API Keys"], dependencies=[Depends(require_admin_key)])
 
 
 class ApiKeyCreate(BaseModel):
     scopes: list[str]
-    created_by: str
-    namespace_id: str | None = None
+    namespace_id: str = ""
     rate_limit_per_minute: int = 60
-    expires_at: str | None = None
+    expires_at: Optional[str] = None
 
 
 @router.post(
-    "/api-keys",
+    "",
     status_code=201,
-    summary="Create a new scoped API key",
+    summary="Create API key",
     description=(
-        "Generates a new API key.  The plaintext key is returned **once** in "
-        "``plaintext_key`` and is never stored.  All subsequent storage uses the "
-        "BLAKE2b hash.  Valid scopes: ``read:scores``, ``write:suppressions``, ``admin``."
+        "Create a new scoped API key. The plaintext key is returned once and never stored. "
+        "Valid scopes: read:scores, write:suppressions, admin."
     ),
 )
 def create_key(body: ApiKeyCreate) -> dict:
-    invalid = [s for s in body.scopes if s not in _VALID_SCOPES]
-    if invalid:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid scopes: {invalid}. Valid scopes: {sorted(_VALID_SCOPES)}",
+    try:
+        return create_api_key(
+            scopes=body.scopes,
+            namespace_id=body.namespace_id,
+            rate_limit_per_minute=body.rate_limit_per_minute,
+            expires_at=body.expires_at,
         )
-    if not body.scopes:
-        raise HTTPException(status_code=422, detail="At least one scope is required")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
-    if body.expires_at is not None:
-        try:
-            datetime.fromisoformat(body.expires_at)
-        except ValueError:
-            raise HTTPException(
-                status_code=422,
-                detail="expires_at must be a valid ISO-8601 datetime string",
-            )
 
-    plaintext = f"llk_{secrets.token_urlsafe(32)}"
-    key_hash = hashlib.blake2b(plaintext.encode(), digest_size=32).hexdigest()
-    key_id = secrets.token_hex(16)
-
-    record = create_api_key(
-        key_id=key_id,
-        key_hash=key_hash,
-        scopes=body.scopes,
-        created_by=body.created_by,
-        namespace_id=body.namespace_id,
-        rate_limit_per_minute=body.rate_limit_per_minute,
-        expires_at=body.expires_at,
-    )
-    record["plaintext_key"] = plaintext
-    return record
+@router.delete(
+    "/{key_id}",
+    summary="Revoke API key",
+    description="Revoke a key immediately. Any subsequent request using this key returns 401.",
+)
+def revoke_key(key_id: str) -> dict:
+    if not revoke_api_key(key_id):
+        raise HTTPException(status_code=404, detail=f"API key {key_id} not found or already revoked")
+    return {"key_id": key_id, "status": "revoked"}
 
 
 @router.get(
-    "/api-keys",
-    summary="List active API keys",
-    description=(
-        "Returns all non-revoked API key records.  Key hashes are **not** "
-        "included in the response."
-    ),
+    "",
+    summary="List API keys",
+    description="Return all API keys with metadata (key hashes are never returned).",
 )
 def get_keys() -> list[dict]:
     return list_api_keys()
 
 
-@router.delete(
-    "/api-keys/{key_id}",
-    summary="Revoke an API key",
-    description=(
-        "Immediately revokes the key identified by ``key_id``.  Any subsequent "
-        "request using the revoked key returns 401 with no caching delay."
-    ),
-)
-def delete_key(key_id: str) -> dict:
-    found = revoke_api_key(key_id)
-    if not found:
-        raise HTTPException(
-            status_code=404,
-            detail=f"API key '{key_id}' not found or already revoked",
-        )
-    return {"status": "revoked", "key_id": key_id}
+def require_scope(required_scope: str):
+    """FastAPI dependency factory: enforce that the request carries a key with the required scope."""
+
+    def _dependency(
+        x_ledgerlens_api_key: str = Header(default="", alias="X-LedgerLens-Api-Key"),
+        x_ledgerlens_admin_key: str = Header(default="", alias="X-LedgerLens-Admin-Key"),
+        request: Request = None,
+    ) -> None:
+        plaintext = x_ledgerlens_api_key or x_ledgerlens_admin_key
+        if not plaintext:
+            raise HTTPException(status_code=401, detail="Missing X-LedgerLens-Api-Key header")
+
+        key_meta = lookup_key(plaintext)
+        if key_meta is None:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+
+        scopes = set(key_meta["scopes"].split(",")) if key_meta["scopes"] else set()
+        if required_scope not in scopes and "admin" not in scopes:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This endpoint requires the '{required_scope}' scope",
+            )
+
+        allowed, retry_after = check_rate_limit(key_meta["key_id"], key_meta["rate_limit_per_minute"])
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    return _dependency

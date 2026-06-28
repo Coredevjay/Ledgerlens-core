@@ -1,171 +1,187 @@
-"""Wallet allowlist and denylist management API — Issue #181.
+"""Wallet allowlist and denylist management with audit trail (Issue #181)."""
 
-Provides CRUD endpoints so exchange operators can permanently flag wallets as
-trusted (allowlisted) or confirmed bad actors (denylisted) independently of
-the ML risk score.  An active override takes effect immediately on the next
-``GET /v1/scores/{wallet}`` call.
-
-All mutations are admin-key gated.  The underlying ``wallet_overrides`` table
-uses soft deletes so the full audit trail (who added or removed each entry and
-when) is always preserved.
-"""
+import sqlite3
+from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from api.auth import require_admin_key
-from detection.storage import (
-    add_wallet_override,
-    get_wallet_overrides,
-    remove_wallet_override,
-)
+from config.settings import settings
 
-router = APIRouter(
-    prefix="/admin",
-    tags=["Allowlist / Denylist"],
-    dependencies=[Depends(require_admin_key)],
-)
+router = APIRouter(prefix="/admin", tags=["Allowlist / Denylist"])
+
+LIST_TYPES = {"allowlist", "denylist"}
 
 
-class OverrideCreate(BaseModel):
+def _ensure_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS wallet_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            list_type TEXT NOT NULL CHECK(list_type IN ('allowlist','denylist')),
+            reason TEXT NOT NULL DEFAULT '',
+            added_by TEXT NOT NULL DEFAULT '',
+            added_at TEXT NOT NULL,
+            removed_at TEXT,
+            removed_by TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_wallet_overrides_wallet
+            ON wallet_overrides (wallet);
+        CREATE INDEX IF NOT EXISTS idx_wallet_overrides_list_type
+            ON wallet_overrides (list_type);
+        """
+    )
+
+
+def get_active_override(wallet: str) -> Optional[dict]:
+    """Return the active override row for wallet, or None."""
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_table(conn)
+        row = conn.execute(
+            """
+            SELECT * FROM wallet_overrides
+            WHERE wallet = ? AND removed_at IS NULL
+            ORDER BY added_at DESC LIMIT 1
+            """,
+            (wallet,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+class OverrideRequest(BaseModel):
     wallet: str
-    reason: str
-    added_by: str
+    reason: str = ""
+    added_by: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Allowlist
-# ---------------------------------------------------------------------------
+def _add_override(list_type: str, body: OverrideRequest) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_table(conn)
+        # Soft-remove any existing active entry first
+        conn.execute(
+            "UPDATE wallet_overrides SET removed_at = ?, removed_by = 'system:replaced' "
+            "WHERE wallet = ? AND list_type = ? AND removed_at IS NULL",
+            (now, body.wallet, list_type),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO wallet_overrides (wallet, list_type, reason, added_by, added_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (body.wallet, list_type, body.reason, body.added_by, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM wallet_overrides WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return dict(row)
+
+
+def _list_overrides(list_type: str, page: int, page_size: int) -> list[dict]:
+    offset = (page - 1) * page_size
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_table(conn)
+        rows = conn.execute(
+            """
+            SELECT * FROM wallet_overrides
+            WHERE list_type = ?
+            ORDER BY added_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (list_type, page_size, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 @router.post(
     "/allowlist",
     status_code=201,
-    summary="Add a wallet to the allowlist",
-    description=(
-        "Marks a wallet as trusted.  Overrides the computed risk score to 0 "
-        "with ``override: 'allowlisted'`` on ``GET /v1/scores/{wallet}``. "
-        "Requires ``X-LedgerLens-Admin-Key`` header."
-    ),
+    summary="Add wallet to allowlist",
+    description="Allowlisted wallets return score=0 with override='allowlisted' immediately.",
+    dependencies=[Depends(require_admin_key)],
 )
-def add_to_allowlist(body: OverrideCreate) -> dict:
-    entry = add_wallet_override(
-        wallet=body.wallet,
-        list_type="allowlist",
-        reason=body.reason,
-        added_by=body.added_by,
-    )
-    return entry
+def add_to_allowlist(body: OverrideRequest) -> dict:
+    return _add_override("allowlist", body)
+
+
+@router.post(
+    "/denylist",
+    status_code=201,
+    summary="Add wallet to denylist",
+    description="Denylisted wallets return score=100 with override='denylisted' immediately.",
+    dependencies=[Depends(require_admin_key)],
+)
+def add_to_denylist(body: OverrideRequest) -> dict:
+    return _add_override("denylist", body)
 
 
 @router.get(
     "/allowlist",
-    summary="List all allowlisted wallets",
-    description=(
-        "Returns active allowlist entries with pagination.  Pass "
-        "``include_removed=true`` to include soft-deleted entries in the audit trail."
-    ),
+    summary="List allowlist entries",
+    description="Returns all allowlist entries (including soft-deleted) with pagination.",
+    dependencies=[Depends(require_admin_key)],
 )
 def list_allowlist(
-    include_removed: bool = Query(default=False),
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
 ) -> list[dict]:
-    return get_wallet_overrides(
-        list_type="allowlist",
-        include_removed=include_removed,
-        limit=limit,
-        offset=offset,
-    )
+    return _list_overrides("allowlist", page, page_size)
+
+
+@router.get(
+    "/denylist",
+    summary="List denylist entries",
+    description="Returns all denylist entries (including soft-deleted) with pagination.",
+    dependencies=[Depends(require_admin_key)],
+)
+def list_denylist(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
+) -> list[dict]:
+    return _list_overrides("denylist", page, page_size)
 
 
 @router.delete(
     "/allowlist/{wallet}",
-    summary="Remove a wallet from the allowlist",
-    description=(
-        "Soft-deletes the active allowlist entry for ``wallet``.  The removal "
-        "is recorded in the audit trail with ``removed_at`` timestamp. "
-        "Returns 404 if the wallet has no active allowlist entry."
-    ),
+    summary="Remove wallet from allowlist",
+    description="Soft-deletes the allowlist entry; history is preserved with removed_at timestamp.",
+    dependencies=[Depends(require_admin_key)],
 )
-def remove_from_allowlist(wallet: str, removed_by: str = Query(...)) -> dict:
-    removed = remove_wallet_override(
-        wallet=wallet,
-        list_type="allowlist",
-        removed_by=removed_by,
-    )
-    if not removed:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active allowlist entry found for wallet {wallet}",
+def remove_from_allowlist(wallet: str, removed_by: str = "") -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(settings.db_path) as conn:
+        _ensure_table(conn)
+        cur = conn.execute(
+            "UPDATE wallet_overrides SET removed_at = ?, removed_by = ? "
+            "WHERE wallet = ? AND list_type = 'allowlist' AND removed_at IS NULL",
+            (now, removed_by or "unknown", wallet),
         )
-    return {"status": "removed", "wallet": wallet, "removed_by": removed_by}
-
-
-# ---------------------------------------------------------------------------
-# Denylist
-# ---------------------------------------------------------------------------
-
-
-@router.post(
-    "/denylist",
-    status_code=201,
-    summary="Add a wallet to the denylist",
-    description=(
-        "Marks a wallet as a confirmed bad actor.  Overrides the computed risk "
-        "score to 100 with ``override: 'denylisted'`` on ``GET /v1/scores/{wallet}``. "
-        "Requires ``X-LedgerLens-Admin-Key`` header."
-    ),
-)
-def add_to_denylist(body: OverrideCreate) -> dict:
-    entry = add_wallet_override(
-        wallet=body.wallet,
-        list_type="denylist",
-        reason=body.reason,
-        added_by=body.added_by,
-    )
-    return entry
-
-
-@router.get(
-    "/denylist",
-    summary="List all denylisted wallets",
-    description=(
-        "Returns active denylist entries with pagination.  Pass "
-        "``include_removed=true`` to include soft-deleted entries in the audit trail."
-    ),
-)
-def list_denylist(
-    include_removed: bool = Query(default=False),
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-) -> list[dict]:
-    return get_wallet_overrides(
-        list_type="denylist",
-        include_removed=include_removed,
-        limit=limit,
-        offset=offset,
-    )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"Wallet {wallet!r} not in allowlist")
+    return {"removed": True, "wallet": wallet, "removed_at": now}
 
 
 @router.delete(
     "/denylist/{wallet}",
-    summary="Remove a wallet from the denylist",
-    description=(
-        "Soft-deletes the active denylist entry for ``wallet``.  The removal "
-        "is recorded in the audit trail with ``removed_at`` timestamp. "
-        "Returns 404 if the wallet has no active denylist entry."
-    ),
+    summary="Remove wallet from denylist",
+    description="Soft-deletes the denylist entry; history is preserved with removed_at timestamp.",
+    dependencies=[Depends(require_admin_key)],
 )
-def remove_from_denylist(wallet: str, removed_by: str = Query(...)) -> dict:
-    removed = remove_wallet_override(
-        wallet=wallet,
-        list_type="denylist",
-        removed_by=removed_by,
-    )
-    if not removed:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active denylist entry found for wallet {wallet}",
+def remove_from_denylist(wallet: str, removed_by: str = "") -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(settings.db_path) as conn:
+        _ensure_table(conn)
+        cur = conn.execute(
+            "UPDATE wallet_overrides SET removed_at = ?, removed_by = ? "
+            "WHERE wallet = ? AND list_type = 'denylist' AND removed_at IS NULL",
+            (now, removed_by or "unknown", wallet),
         )
-    return {"status": "removed", "wallet": wallet, "removed_by": removed_by}
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"Wallet {wallet!r} not in denylist")
+    return {"removed": True, "wallet": wallet, "removed_at": now}
