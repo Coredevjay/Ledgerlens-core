@@ -304,7 +304,7 @@ from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
 app.include_router(admin_router)
-
+app.include_router(api_key_router)
 
 app.include_router(batch_router)
 
