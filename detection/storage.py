@@ -401,6 +401,28 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
         """,
     ),
+    (
+        15,
+        "add dead_letter_queue table for trade ingestion failures",
+        """
+        CREATE TABLE IF NOT EXISTS dead_letter_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            error_class TEXT NOT NULL,
+            error_message TEXT NOT NULL,
+            raw_record_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'replayed', 'dead')),
+            replayed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_idlq_status ON dead_letter_queue (status);
+        CREATE INDEX IF NOT EXISTS idx_idlq_error_class ON dead_letter_queue (error_class);
+        CREATE INDEX IF NOT EXISTS idx_idlq_source ON dead_letter_queue (source);
+        CREATE INDEX IF NOT EXISTS idx_idlq_created_at ON dead_letter_queue (created_at);
+        """,
+    ),
 ]
 
 

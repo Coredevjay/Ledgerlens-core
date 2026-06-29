@@ -1329,5 +1329,66 @@ def db_rollback(
     raise typer.Exit(result.returncode)
 
 
+dlq_app = typer.Typer(help="Dead-letter queue management")
+app.add_typer(dlq_app, name="dlq")
+
+
+@dlq_app.command("list")
+def dlq_list(
+    status: str = typer.Option(None, help="Filter by status: pending, replayed, dead"),
+    error_class: str = typer.Option(None, "--error-class", help="Filter by error class"),
+    source: str = typer.Option(None, help="Filter by ingestion source"),
+    limit: int = typer.Option(50, help="Max entries to show"),
+) -> None:
+    """List dead-letter queue entries."""
+    from ingestion.dlq import DLQErrorClass, TradeDLQ
+
+    dlq = TradeDLQ()
+    ec = DLQErrorClass(error_class) if error_class else None
+    entries = dlq.list_entries(status=status, error_class=ec, source=source, limit=limit)
+    if not entries:
+        typer.echo("No DLQ entries found.")
+        return
+    for e in entries:
+        typer.echo(f"[{e.id}] {e.status} | {e.error_class} | {e.source} | {e.created_at} | {e.error_message[:80]}")
+
+
+@dlq_app.command("replay")
+def dlq_replay(
+    entry_id: int = typer.Argument(help="DLQ entry ID to replay"),
+) -> None:
+    """Mark a DLQ entry as replayed (operator confirmation)."""
+    from ingestion.dlq import TradeDLQ
+
+    dlq = TradeDLQ()
+    dlq.mark_replayed(entry_id)
+    typer.echo(f"Entry {entry_id} marked as replayed.")
+
+
+@dlq_app.command("inspect")
+def dlq_inspect(
+    entry_id: int = typer.Argument(help="DLQ entry ID to inspect"),
+) -> None:
+    """Show the full raw record and error for a DLQ entry."""
+    import json
+
+    from ingestion.dlq import TradeDLQ
+
+    dlq = TradeDLQ()
+    all_entries = dlq.list_entries(limit=10000)
+    entry = next((e for e in all_entries if e.id == entry_id), None)
+    if not entry:
+        typer.echo(f"Entry {entry_id} not found.")
+        raise typer.Exit(1)
+    typer.echo(f"ID: {entry.id}  Source: {entry.source}  Class: {entry.error_class}")
+    typer.echo(f"Status: {entry.status}  Created: {entry.created_at}  Retries: {entry.retry_count}")
+    typer.echo(f"Error: {entry.error_message}")
+    try:
+        raw = json.loads(entry.raw_record)
+        typer.echo(f"Raw record:\n{json.dumps(raw, indent=2)}")
+    except Exception:
+        typer.echo(f"Raw record: {entry.raw_record}")
+
+
 if __name__ == "__main__":
     app()
