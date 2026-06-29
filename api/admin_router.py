@@ -16,6 +16,7 @@ from slowapi.util import get_remote_address
 from api.auth import require_admin_key
 from api.webhook_sender import list_dlq, get_dlq_entry
 from api.webhook_sender import WebhookRetryQueue
+from detection.webhook_registry import get_subscriber
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
 from detection.storage import get_krum_aggregation_log
@@ -278,4 +279,60 @@ def fl_privacy_status() -> FLPrivacyStatus:
         clip_norm=clip_norm,
         budget_exhausted=budget_exhausted,
         rounds_completed=len(rows),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/webhooks/dlq
+# ---------------------------------------------------------------------------
+
+
+@router.get("/webhooks/dlq", include_in_schema=False)
+def list_webhook_dlq() -> list[dict]:
+    """Return all dead-lettered webhook deliveries (admin-key gated)."""
+    entries = list_dlq()
+    return [
+        {
+            "id": e.id,
+            "subscriber_id": e.subscriber_id,
+            "url": e.url,
+            "attempt_count": e.attempt_count,
+            "last_error": e.last_error,
+            "dead_lettered_at": e.dead_lettered_at,
+        }
+        for e in entries
+    ]
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/webhooks/dlq/{entry_id}/retry
+# ---------------------------------------------------------------------------
+
+
+@router.post("/webhooks/dlq/{entry_id}/retry", include_in_schema=False)
+async def retry_webhook_dlq_entry(entry_id: int) -> dict:
+    """Manually retry a dead-lettered webhook delivery (admin-key gated).
+
+    Looks up the subscriber's decrypted secret from the registry and
+    re-attempts delivery with the same HMAC-signed payload.  On success the
+    entry is removed from the DLQ; on failure it remains for future retries.
+    """
+    entry = get_dlq_entry(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"DLQ entry {entry_id} not found")
+
+    subscriber = get_subscriber(entry.subscriber_id)
+    if not subscriber:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Subscriber {entry.subscriber_id!r} no longer registered; cannot retry",
+        )
+
+    queue = WebhookRetryQueue()
+    success = await queue.retry_dlq_entry(entry_id, subscriber.secret)
+    if success:
+        return {"status": "delivered", "dlq_id": entry_id}
+    raise HTTPException(
+        status_code=502,
+        detail="Retry delivery failed; entry remains in DLQ",
     )
